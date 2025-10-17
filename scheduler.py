@@ -43,7 +43,7 @@ def run_quant_analysis():
         # 执行量化分析脚本（直接输出到终端）
         result = subprocess.run([
             sys.executable, "quant_analysis copy.py"
-        ], timeout=300)  # 5分钟超时，不捕获输出，直接显示在终端
+        ], timeout=600)  # 10分钟超时，不捕获输出，直接显示在终端
         
         if result.returncode == 0:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行成功")
