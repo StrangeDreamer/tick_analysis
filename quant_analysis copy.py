@@ -92,6 +92,7 @@ class QuantAnalysis:
                 tick_df = tick_df.rename(columns={
                     '成交时间': '时间',
                     '成交价格': '成交价',
+                    '价格变动': '价格变动',
                     '成交量': '成交量',
                     '成交金额': '成交额',
                     '性质': '买卖盘性质'
@@ -104,8 +105,8 @@ class QuantAnalysis:
                 tick_df = tick_df.sort_values('时间')
                 
                 # 计算资金流向相关指标
-                # 1. 计算价格变动（元）
-                tick_df['dp'] = tick_df['成交价'].diff().fillna(0)
+                # 1. 使用API返回的价格变动（元）
+                tick_df['dp'] = tick_df['价格变动']
 
                 # 2. 价变权重
                 tick_df['w1'] = np.tanh(np.abs(tick_df['dp']) / 0.01) * np.sign(tick_df['dp'])
@@ -174,7 +175,7 @@ class QuantAnalysis:
                     tick_df = tick_df.sort_values('时间')
                     
                     # 计算资金流向相关指标
-                    # 1. 计算价格变动（元）
+                    # 1. 计算价格变动（元）- stock_intraday_em接口没有价格变动字段
                     tick_df['dp'] = tick_df['成交价'].diff().fillna(0)
 
                     # 2. 价变权重
