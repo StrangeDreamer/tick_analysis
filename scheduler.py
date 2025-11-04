@@ -43,7 +43,7 @@ def run_quant_analysis():
         # 执行量化分析脚本（直接输出到终端）
         result = subprocess.run([
             sys.executable, "quant_analysis copy.py"
-        ], timeout=600)  # 10分钟超时，不捕获输出，直接显示在终端
+        ], timeout=1200)  # 20分钟超时，不捕获输出，直接显示在终端
         
         if result.returncode == 0:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行成功")
@@ -53,7 +53,7 @@ def run_quant_analysis():
             return False
             
     except subprocess.TimeoutExpired:
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行超时（5分钟）")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行超时（20分钟）")
         return False
     except Exception as e:
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 执行异常: {e}")
@@ -66,7 +66,7 @@ def main():
     print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("开市时间: 周一至周五 9:30-15:00")
     print("执行模式: 循环执行（上一轮完成后立即开始下一轮）")
-    print("超时时间: 5分钟")
+    print("超时时间: 20分钟")
     print("=" * 60)
     
     round_count = 0
