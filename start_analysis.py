@@ -27,7 +27,7 @@ def is_trading_time():
     
     return False
 
-def run_analysis(code=None, refresh=False, custom_only=False, source='zt'):
+def run_analysis(code=None, refresh=False, refresh_filter=False, custom_only=False, no_filter=False, source='hot_rank'):
     """执行量化分析"""
     # 构建命令
     cmd = [sys.executable, "quant_analysis copy.py"]
@@ -38,8 +38,14 @@ def run_analysis(code=None, refresh=False, custom_only=False, source='zt'):
     if refresh:
         cmd.append("--refresh")
     
+    if refresh_filter:
+        cmd.append("--refresh-filter")
+    
     if custom_only:
         cmd.append("--custom-only")
+    
+    if no_filter:
+        cmd.append("--no-filter")
     
     if source:
         cmd.extend(["--source", source])
@@ -236,9 +242,11 @@ def main():
     parser.add_argument('--list-zt', action='store_true', help='查看累积涨停股票池')
     parser.add_argument('--force', '-f', action='store_true', help='强制循环执行，忽略开市时间限制')
     parser.add_argument('--refresh', '-r', action='store_true', help='强制刷新热门股票缓存（重新调用API获取）')
+    parser.add_argument('--refresh-filter', action='store_true', help='强制刷新股价和筹码筛选缓存（重新调用API获取）')
     parser.add_argument('--custom-only', action='store_true', help='只分析自定义股票，不分析热门股票')
-    parser.add_argument('--source', '-s', type=str, choices=['ljqs', 'zt'], default='zt',
-                       help='热门股票源: zt=昨日涨停池(默认), ljqs=量价齐升')
+    parser.add_argument('--no-filter', action='store_true', help='跳过筛选，直接获取所有股票的tick数据并排名')
+    parser.add_argument('--source', '-s', type=str, choices=['ljqs', 'zt', 'hot_rank'], default='hot_rank',
+                       help='热门股票源: hot_rank=热门排行榜(默认), zt=昨日涨停池, ljqs=量价齐升')
     
     args = parser.parse_args()
     
@@ -310,7 +318,7 @@ def main():
         
         for i, code in enumerate(codes, 1):
             print(f"\n{'='*20} 分析第 {i}/{len(codes)} 只股票 {'='*20}")
-            success = run_analysis(code, args.refresh, source=args.source)
+            success = run_analysis(code, args.refresh, args.refresh_filter, no_filter=args.no_filter, source=args.source)
             if success:
                 print(f"✅ 股票 {code} 分析完成")
                 success_count += 1
@@ -342,7 +350,8 @@ def main():
         if args.custom_only:
             print("分析模式: 只分析自定义股票")
         else:
-            source_name = "昨日涨停池" if args.source == 'zt' else "量价齐升"
+            source_names = {'zt': '昨日涨停池', 'ljqs': '量价齐升', 'hot_rank': '热门排行榜'}
+            source_name = source_names.get(args.source, '未知')
             print(f"分析模式: 热门股票({source_name}) + 自定义股票")
         if args.refresh:
             print("缓存模式: 强制刷新热门股票缓存")
@@ -364,7 +373,7 @@ def main():
                 
                 # 执行量化分析
                 start_time = time.time()
-                success = run_analysis(None, args.refresh, args.custom_only, args.source)  # 分析股票
+                success = run_analysis(None, args.refresh, args.refresh_filter, args.custom_only, args.no_filter, args.source)  # 分析股票
                 end_time = time.time()
                 
                 execution_time = end_time - start_time
