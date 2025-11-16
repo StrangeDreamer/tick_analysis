@@ -38,6 +38,6 @@ Thumbs.db
 *.temp
 
 # 缓存文件
-*_cache.json
-*_stocks.json
-market_close_prices.json
+# *_cache.json
+# *_stocks.json
+# market_close_prices.json
