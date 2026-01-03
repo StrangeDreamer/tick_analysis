@@ -7,6 +7,7 @@
 import os
 import warnings
 import sys
+import random
 
 # 在导入其他库之前抑制所有警告（包括 urllib3 的 OpenSSL 警告）
 warnings.filterwarnings('ignore')
@@ -44,6 +45,7 @@ class QuantAnalysis:
         self.trade_directions = {}
         self.scores = {}
         self.max_workers = 10
+        self.cache_file = "hot_stocks_cache.json"
 
     def get_accurate_previous_close(self, symbol):
         """通过实时接口获取准确的昨日收盘价（已考虑复权因子）"""
@@ -185,7 +187,19 @@ class QuantAnalysis:
             return {}, {}
 
     def get_hot_stocks(self):
-        """获取当日最热的沪深主板非ST A股股票"""
+        """获取当日最热的沪深主板非ST A股股票，带每日缓存"""
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                    if cache_data.get('date') == today_str:
+                        print("✅ 从缓存加载热门股票列表")
+                        return cache_data.get('stocks', [])
+            except (json.JSONDecodeError, IOError):
+                print("⚠️ 缓存文件损坏，将重新获取")
+
         print("🔄 从API获取热门股票排行榜...")
         
         try:
@@ -198,32 +212,54 @@ class QuantAnalysis:
             print("❌ 热门股票排行榜数据为空")
             return []
 
-        # 过滤条件：沪深主板、非ST的股票、股价在5-30元之间
-        filtered_stocks_df = hot_rank_df[
-            (hot_rank_df['代码'].str.startswith(('SZ000', 'SZ001', 'SZ002', 'SH600', 'SH601', 'SH603', 'SH605'))) &
-            (~hot_rank_df['股票名称'].str.contains('ST')) &
-            (hot_rank_df['最新价'] >= 5) &
-            (hot_rank_df['最新价'] <= 30)
-        ].copy()
+        # 定义筛选条件
+        is_main_board = hot_rank_df['代码'].str.startswith(('SZ000', 'SZ001', 'SZ002', 'SH600', 'SH601', 'SH603', 'SH605'))
+        is_not_st = ~hot_rank_df['股票名称'].str.contains('ST')
+        is_price_ok = (hot_rank_df['最新价'] >= 5) & (hot_rank_df['最新价'] <= 30)
+        
+        # 应用筛选
+        filtered_stocks_df = hot_rank_df[is_main_board & is_not_st & is_price_ok].copy()
         
         print(f"📊 筛选结果: {len(hot_rank_df)}只 → {len(filtered_stocks_df)}只")
         print(f"   - 沪深主板: ✓")
         print(f"   - 非ST股票: ✓")
         print(f"   - 价格5-30元: ✓")
+
+        # 找出被剔除的股票并分析原因
+        rejected_df = hot_rank_df[~(is_main_board & is_not_st & is_price_ok)]
+        if not rejected_df.empty:
+            print("\n🔍 被剔除股票随机抽样分析:")
+            sample_size = min(5, len(rejected_df))
+            for _, row in rejected_df.sample(n=sample_size).iterrows():
+                reasons = []
+                if not row['代码'].startswith(('SZ000', 'SZ001', 'SZ002', 'SH600', 'SH601', 'SH603', 'SH605')):
+                    reasons.append("非主板")
+                if 'ST' in row['股票名称']:
+                    reasons.append("ST股")
+                if not (5 <= row['最新价'] <= 30):
+                    reasons.append(f"价格({row['最新价']:.2f}元)不符")
+                
+                print(f"  - {row['代码']} {row['股票名称']}: 被剔除，原因: {', '.join(reasons)}")
         
         # 转换为字典格式
         final_stocks = filtered_stocks_df.to_dict('records')
         
-        # 填充缺失的股票名称
         final_stocks = self._fill_missing_stock_names(final_stocks)
         
         if final_stocks:
-            print(f"✅ 获取{len(final_stocks)}只热门股票")
+            print(f"\n✅ 获取{len(final_stocks)}只热门股票")
             print("🔥 热门股票（热门排行榜）:")
             for stock in final_stocks[:10]:
                 print(f"  {stock['代码']} {stock['股票名称']} 价格:{stock.get('最新价', 'N/A')} 涨跌幅:{stock.get('涨跌幅', 'N/A')}%")
             if len(final_stocks) > 10:
                 print(f"  ... 还有 {len(final_stocks) - 10} 只股票")
+            
+            try:
+                with open(self.cache_file, 'w', encoding='utf-8') as f:
+                    json.dump({'date': today_str, 'stocks': final_stocks}, f, ensure_ascii=False, indent=4)
+                print(f"💾 热门股票列表已缓存至 {self.cache_file}")
+            except IOError as e:
+                print(f"❌ 缓存热门股票列表失败: {e}")
         else:
             print("⚠️ 筛选后热门股票为空")
             
@@ -233,7 +269,6 @@ class QuantAnalysis:
         """获取股票列表（仅热门股票）"""
         hot_stocks = self.get_hot_stocks()
         
-        # 去重（以代码为准）
         seen_symbols = set()
         unique_stocks = []
         for stock in hot_stocks:
@@ -264,6 +299,7 @@ class QuantAnalysis:
             return None
 
         if tick_df is None or tick_df.empty:
+            print(f"  ❌ {symbol} 未获取到tick数据")
             return None
 
         print(f"  成功获取 {len(tick_df)} 条tick数据")
@@ -297,6 +333,11 @@ class QuantAnalysis:
             print(f"  ⚠️ {symbol} 过滤后数据为空，返回None")
             return None
         
+        # 打印最新的5条tick数据
+        print(f"  最新5条Tick数据 for {symbol}:")
+        for _, row in tick_df.tail(5).iterrows():
+            print(f"    {row['时间'].strftime('%H:%M:%S')} - 价格: {row['成交价']:.2f}, 成交量: {row['成交量']}手, 性质: {row['买卖盘性质']}")
+
         return tick_df[['时间', '成交价', '成交量', '成交额', '买卖盘性质', 'meanV', 'w2', 'prob', 'mf']]
 
     def get_tick_data_worker(self, symbol):
