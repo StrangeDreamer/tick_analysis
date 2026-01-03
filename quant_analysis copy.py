@@ -193,7 +193,6 @@ class QuantAnalysis:
         try:
             tick_df = ak.stock_zh_a_tick_tx_js(symbol=tick_symbol)
         except Exception as e:
-            # 在工作线程中捕获异常，以便超时可以工作
             raise e
 
         if tick_df is None or tick_df.empty:
@@ -203,10 +202,11 @@ class QuantAnalysis:
         print(f"  成功获取 {len(tick_df)} 条原始tick数据")
         
         tick_df = tick_df.rename(columns={
-            '成交时间': '时间', '成交价格': '成交价', '成交量': '成交量', '性质': '买卖盘性质'
+            '成交时间': '时间', '成交价格': '成交价', '成交量': '成交量', 
+            '性质': '买卖盘性质', '价格变动': '价格变动'
         })
         
-        tick_df = tick_df[['时间', '成交价', '成交量', '买卖盘性质']]
+        tick_df = tick_df[['时间', '成交价', '成交量', '买卖盘性质', '价格变动']]
         tick_df['时间'] = pd.to_datetime(tick_df['时间'])
         tick_df = tick_df.sort_values('时间')
         
@@ -214,9 +214,11 @@ class QuantAnalysis:
         tick_df = tick_df[tick_df['买卖盘性质'].isin(['买盘', '卖盘'])].copy()
         print(f"  过滤中性盘: {original_len}条 → {len(tick_df)}条")
 
-        # akshare接口返回的成交量单位已经是“手”，无需转换
         tick_df['成交量'] = tick_df['成交量'].astype(int)
         
+        tick_df.loc[tick_df['成交量'] > 0, 'price_impact'] = tick_df['价格变动'] / tick_df['成交量']
+        tick_df['price_impact'].fillna(0, inplace=True)
+
         original_len = len(tick_df)
         tick_df = tick_df[tick_df['成交量'] > 0].copy()
         if original_len > len(tick_df):
@@ -267,7 +269,7 @@ class QuantAnalysis:
     def analyze_trade_direction(self, tick_df, symbol):
         """分析股票的主动买卖性质"""
         if tick_df is None or tick_df.empty:
-            return {'buy_ratio': 0, 'sell_ratio': 0, 'net_buy_volume': 0, 'active_buy_ratio': 0, 'active_sell_ratio': 0, 'buy_volume': 0, 'sell_volume': 0, 'total_trades': 0}
+            return {}
         
         total_trades = len(tick_df)
         buy_mask = tick_df['买卖盘性质'] == '买盘'
@@ -289,22 +291,50 @@ class QuantAnalysis:
             'total_trades': total_trades
         }
 
-    def calculate_score(self, symbol, tick_df, trade_direction):
-        """计算股票上涨概率得分"""
-        if tick_df is None or tick_df.empty:
-            return 0
+    def calculate_score(self, trade_direction, afternoon_net_buy_volume, avg_abs_impact):
+        """计算股票上涨概率得分 (V2 - 包含动量和智能价格冲击)"""
+        
+        # 1. 主动买入强度得分 (60%)
+        active_buy_ratio = trade_direction.get('active_buy_ratio', 0.5)
+        buy_sell_score = (active_buy_ratio - 0.5) * 2 * 60
+        
+        # 2. 净买入量得分 (20%)
+        net_buy_volume = trade_direction.get('net_buy_volume', 0)
+        total_volume = trade_direction.get('buy_volume', 0) + trade_direction.get('sell_volume', 0)
+        net_buy_ratio = net_buy_volume / total_volume if total_volume > 0 else 0
+        net_buy_score = np.clip(net_buy_ratio * 40, -20, 20)
+
+        # 3. 平均价格冲击得分 (20%) - 智能调整
+        impact_score = 20 - (avg_abs_impact / 0.05) * 40
+        impact_score = np.clip(impact_score, -20, 20)
+        
+        if active_buy_ratio > 0.7 and impact_score < 0:
+            impact_score /= 2
+        elif active_buy_ratio < 0.5 and impact_score < 0:
+            impact_score *= 1.5
+        impact_score = np.clip(impact_score, -20, 20)
+
+        # 4. 动量得分 (额外 +/-10分)
+        momentum_score = 0
+        full_day_net_buy = trade_direction.get('net_buy_volume', 0)
+        if full_day_net_buy > 0 and afternoon_net_buy_volume > 0:
+            afternoon_ratio = afternoon_net_buy_volume / full_day_net_buy
+            if afternoon_ratio > 0.6:
+                momentum_score = 10 * min((afternoon_ratio - 0.6) / 0.4, 1.0)
+        elif full_day_net_buy > 0 and afternoon_net_buy_volume < 0:
+            momentum_score = -10
             
-        active_buy_ratio = trade_direction['active_buy_ratio']
-        buy_sell_score = (active_buy_ratio - 0.5) * 2 * 70
+        # 5. 共振奖励 (额外 +10分)
+        resonance_bonus = 0
+        if buy_sell_score > 50 and net_buy_score > 15:
+            resonance_bonus = 10
+
+        total_score = buy_sell_score + net_buy_score + impact_score + momentum_score + resonance_bonus
         
-        net_buy_volume = trade_direction['net_buy_volume']
-        avg_volume = tick_df['成交量'].mean()
-        net_buy_score = 0
-        if avg_volume > 0:
-            net_buy_score = np.clip(net_buy_volume / (avg_volume * 10), -15, 15) * 2
-        
-        score = buy_sell_score * 0.7 + net_buy_score * 0.3
-        return score
+        return {
+            'score': np.clip(total_score, -100, 100),
+            'avg_abs_impact': avg_abs_impact
+        }
 
     def analyze_stock_worker(self, stock, tick_df):
         """分析单个股票的工作函数（计算交易方向和得分）"""
@@ -312,18 +342,30 @@ class QuantAnalysis:
         name = stock['股票名称']
         
         intraday_change = 0.0
-        if tick_df is not None and not tick_df.empty:
+        if not tick_df.empty:
             first_price = float(tick_df['成交价'].iloc[0])
             last_price = float(tick_df['成交价'].iloc[-1])
             if first_price > 0:
                 intraday_change = ((last_price - first_price) / first_price) * 100
         
         trade_direction = self.analyze_trade_direction(tick_df, symbol)
-        score = self.calculate_score(symbol, tick_df, trade_direction)
+        
+        afternoon_start_time = pd.to_datetime('13:00:00').time()
+        afternoon_ticks = tick_df[tick_df['时间'].dt.time >= afternoon_start_time]
+        afternoon_trade_direction = self.analyze_trade_direction(afternoon_ticks, symbol)
+        afternoon_net_buy_volume = afternoon_trade_direction.get('net_buy_volume', 0)
+        
+        avg_abs_impact = tick_df['price_impact'].abs().mean() if 'price_impact' in tick_df.columns else 0
+
+        score_info = self.calculate_score(trade_direction, afternoon_net_buy_volume, avg_abs_impact)
         
         return (symbol, {
-            'name': name, 'score': score, 'trade_direction': trade_direction,
-            'tick_df': tick_df, 'intraday_change': intraday_change
+            'name': name, 
+            'score': score_info['score'], 
+            'avg_abs_impact': score_info['avg_abs_impact'],
+            'trade_direction': trade_direction,
+            'tick_df': tick_df, 
+            'intraday_change': intraday_change
         })
 
     def analyze_stocks(self):
@@ -372,7 +414,9 @@ class QuantAnalysis:
             self.tick_data[symbol] = analysis['tick_df']
             self.trade_directions[symbol] = analysis['trade_direction']
             self.scores[symbol] = {
-                'name': analysis['name'], 'score': analysis['score'],
+                'name': analysis['name'], 
+                'score': analysis['score'],
+                'avg_abs_impact': analysis['avg_abs_impact'],
                 'trade_direction': analysis['trade_direction'],
                 'intraday_change': analysis.get('intraday_change', 0.0)
             }
@@ -415,6 +459,7 @@ class QuantAnalysis:
             stock_price = f"{current_price:.2f}元" if current_price is not None else "N/A"
             
             intraday_change = data.get('intraday_change', 0.0)
+            avg_abs_impact = data.get('avg_abs_impact', 0.0)
             
             text += f"""### {i}. {symbol} {data['name']}
 - **得分**: {data['score']:.2f}
@@ -422,6 +467,7 @@ class QuantAnalysis:
 - **日内涨跌幅**: {intraday_change:.2f}%
 - **主动买入强度**: {trade_direction['active_buy_ratio']:.1%}
 - **净买入量**: {trade_direction['net_buy_volume']:,.0f}
+- **平均价格冲击**: {avg_abs_impact:.4f}
 
 """
         
