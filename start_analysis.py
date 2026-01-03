@@ -5,10 +5,11 @@
 支持单次执行和循环执行模式
 """
 
-import subprocess
 import sys
 import argparse
 import time
+import os
+import importlib.util
 from datetime import datetime, time as dt_time
 
 def is_trading_time():
@@ -19,49 +20,102 @@ def is_trading_time():
     
     # 周一到周五
     if weekday < 5:
-        # 开市时间：9:30-15:00（连续交易时间）
-        trading_start = dt_time(9, 30)
-        trading_end = dt_time(15, 0)
+        # 上午交易时间：9:30-11:30
+        morning_start = dt_time(9, 30)
+        morning_end = dt_time(11, 30)
+        # 下午交易时间：13:00-15:00
+        afternoon_start = dt_time(13, 0)
+        afternoon_end = dt_time(15, 0)
         
-        return trading_start <= current_time <= trading_end
+        # 检查是否在上午或下午交易时间内
+        is_morning = morning_start <= current_time <= morning_end
+        is_afternoon = afternoon_start <= current_time <= afternoon_end
+        
+        return is_morning or is_afternoon
     
     return False
 
 def run_analysis(code=None, refresh=False, refresh_filter=False, custom_only=False, no_filter=False, source='hot_rank'):
-    """执行量化分析"""
-    # 构建命令
-    cmd = [sys.executable, "quant_analysis copy.py"]
-    
-    if code:
-        cmd.extend(["--code", code])
-    
-    if refresh:
-        cmd.append("--refresh")
-    
-    if refresh_filter:
-        cmd.append("--refresh-filter")
-    
-    if custom_only:
-        cmd.append("--custom-only")
-    
-    if no_filter:
-        cmd.append("--no-filter")
-    
-    if source:
-        cmd.extend(["--source", source])
-    
-    # 执行量化分析
+    """执行量化分析 - 直接导入模块调用，避免新窗口"""
     try:
-        result = subprocess.run(cmd, check=True, timeout=1200)  # 20分钟超时
-        return result.returncode == 0
-    except subprocess.CalledProcessError as e:
-        print(f"❌ 分析失败: {e}")
-        return False
-    except subprocess.TimeoutExpired:
-        print(f"❌ 分析超时（20分钟）")
-        return False
+        # 动态导入 quant_analysis copy.py 模块（因为文件名包含空格）
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        module_path = os.path.join(script_dir, "quant_analysis copy.py")
+        
+        spec = importlib.util.spec_from_file_location("quant_analysis_copy", module_path)
+        if spec is None or spec.loader is None:
+            print(f"❌ 无法加载模块: {module_path}")
+            return False
+        
+        quant_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(quant_module)
+        
+        # 创建 QuantAnalysis 实例
+        analyzer = quant_module.QuantAnalysis()
+        
+        # 设置股票源
+        analyzer.stock_source = source
+        
+        # 如果需要强制刷新缓存，删除缓存文件
+        if refresh:
+            if os.path.exists(analyzer.hot_stocks_cache_file):
+                os.remove(analyzer.hot_stocks_cache_file)
+                print("🔄 已删除热门股票缓存，将重新获取...")
+        
+        # 如果需要强制刷新筛选缓存，删除筛选缓存文件
+        if refresh_filter:
+            if os.path.exists(analyzer.price_cyq_filter_cache_file):
+                os.remove(analyzer.price_cyq_filter_cache_file)
+                print("🔄 已删除股价和筹码筛选缓存，将重新获取...")
+            
+            # 如果数据源是 hot_rank，也删除热门排行榜缓存
+            if analyzer.stock_source == 'hot_rank':
+                if os.path.exists(analyzer.hot_stocks_cache_file):
+                    try:
+                        import json
+                        with open(analyzer.hot_stocks_cache_file, 'r', encoding='utf-8') as f:
+                            cache_data = json.load(f)
+                            cache_source = cache_data.get('source', 'zt')
+                            if cache_source == 'hot_rank':
+                                os.remove(analyzer.hot_stocks_cache_file)
+                                print("🔄 已删除热门排行榜缓存，将重新获取...")
+                    except:
+                        pass
+            
+            analyzer.refresh_filter_cache = True
+        else:
+            analyzer.refresh_filter_cache = False
+        
+        # 执行分析
+        if code:
+            # 分析单个股票
+            result = analyzer.analyze_single_stock(code)
+            if result:
+                print(f"\n🎯 分析完成！股票 {result['symbol']} ({result['name']}) 得分: {result['score']:.2f}")
+                return True
+            else:
+                print(f"❌ 分析失败")
+                return False
+        else:
+            # 默认分析股票
+            if custom_only:
+                print("🔍 量化分析系统 - 只分析自定义股票")
+                analyzer.run_analysis(custom_only=True)
+            elif no_filter:
+                print("🔍 量化分析系统 - 直接获取tick数据模式（跳过筛选）")
+                analyzer.run_analysis(no_filter=True)
+            else:
+                print("🔍 量化分析系统 - 分析热门股票 + 自定义股票")
+                analyzer.run_analysis(custom_only=False)
+            return True
+            
     except KeyboardInterrupt:
         print("\n⚠️ 用户中断分析")
+        return False
+    except Exception as e:
+        print(f"❌ 分析失败: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def delete_custom_stock(code):
@@ -143,11 +197,10 @@ def list_custom_stocks():
             code = stock.get('代码', 'N/A')
             name = stock.get('股票名称', 'N/A')
             price = stock.get('最新价', 'N/A')
-            change = stock.get('涨跌幅', 'N/A')
             
             print(f"{i:3d}. {code:10s} {name:20s}", end='')
-            if price != 'N/A' and change != 'N/A':
-                print(f" 价格:{price:6.2f} 涨跌幅:{change:6.2f}%")
+            if price != 'N/A':
+                print(f" 价格:{price:6.2f}")
             else:
                 print()
         
@@ -343,7 +396,7 @@ def main():
         if args.force:
             print("执行模式: 强制循环执行（忽略开市时间限制）")
         else:
-            print("开市时间: 周一至周五 9:30-15:00")
+            print("开市时间: 周一至周五 9:30-11:30, 13:00-15:00")
             print("执行模式: 循环执行（每2分钟执行一轮）")
         print("执行间隔: 2分钟")
         print("超时时间: 20分钟")
@@ -384,7 +437,18 @@ def main():
                 else:
                     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 第 {round_count} 轮执行失败")
                 
-                # 等待2分钟后执行下一轮
+                # 判断是否在开市日上午9:30-10:00时间段
+                now = datetime.now()
+                current_time = now.time()
+                morning_rush_start = dt_time(9, 30)  # 9:30
+                morning_rush_end = dt_time(10, 0)    # 10:00
+                
+                # 如果在9:30-10:00时间段，立即执行下一轮（不等待）
+                if morning_rush_start <= current_time <= morning_rush_end:
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 当前在开市日上午9:30-10:00时间段，立即执行下一轮（无等待）")
+                    continue  # 直接进入下一轮循环，不等待
+                
+                # 其他时间段，等待2分钟后执行下一轮
                 wait_minutes = 2
                 wait_seconds = wait_minutes * 60
                 next_time = datetime.now().timestamp() + wait_seconds

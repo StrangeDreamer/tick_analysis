@@ -6,8 +6,8 @@
 """
 
 import time
-import subprocess
 import sys
+import importlib.util
 from datetime import datetime, time as dt_time
 import os
 
@@ -19,16 +19,23 @@ def is_trading_time():
     
     # 周一到周五
     if weekday < 5:
-        # 开市时间：9:30-15:00（连续交易时间）
-        trading_start = dt_time(9, 30)
-        trading_end = dt_time(15, 0)
+        # 上午交易时间：9:30-11:30
+        morning_start = dt_time(9, 30)
+        morning_end = dt_time(11, 30)
+        # 下午交易时间：13:00-15:00
+        afternoon_start = dt_time(13, 0)
+        afternoon_end = dt_time(15, 0)
         
-        return trading_start <= current_time <= trading_end
+        # 检查是否在上午或下午交易时间内
+        is_morning = morning_start <= current_time <= morning_end
+        is_afternoon = afternoon_start <= current_time <= afternoon_end
+        
+        return is_morning or is_afternoon
     
     return False
 
 def run_quant_analysis():
-    """执行量化分析"""
+    """执行量化分析 - 直接导入模块调用，避免新窗口"""
     if not is_trading_time():
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 非开市时间，跳过执行")
         return False
@@ -40,23 +47,35 @@ def run_quant_analysis():
         script_dir = os.path.dirname(os.path.abspath(__file__))
         os.chdir(script_dir)
         
-        # 执行量化分析脚本（直接输出到终端）
-        result = subprocess.run([
-            sys.executable, "quant_analysis copy.py"
-        ], timeout=1200)  # 20分钟超时，不捕获输出，直接显示在终端
+        # 动态导入 quant_analysis copy.py 模块（因为文件名包含空格）
+        module_path = os.path.join(script_dir, "quant_analysis copy.py")
         
-        if result.returncode == 0:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行成功")
-            return True
-        else:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行失败，错误码: {result.returncode}")
+        spec = importlib.util.spec_from_file_location("quant_analysis_copy", module_path)
+        if spec is None or spec.loader is None:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ 无法加载模块: {module_path}")
             return False
+        
+        quant_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(quant_module)
+        
+        # 创建 QuantAnalysis 实例并执行分析
+        analyzer = quant_module.QuantAnalysis()
+        analyzer.stock_source = 'hot_rank'  # 默认使用热门排行榜
+        analyzer.refresh_filter_cache = False
+        
+        print("🔍 量化分析系统 - 分析热门股票 + 自定义股票")
+        analyzer.run_analysis(custom_only=False)
+        
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行成功")
+        return True
             
-    except subprocess.TimeoutExpired:
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 量化分析执行超时（20分钟）")
+    except KeyboardInterrupt:
+        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ 用户中断分析")
         return False
     except Exception as e:
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 执行异常: {e}")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ 执行异常: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def main():
@@ -64,7 +83,7 @@ def main():
     print("=" * 60)
     print("量化分析循环执行调度器启动")
     print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("开市时间: 周一至周五 9:30-15:00")
+    print("开市时间: 周一至周五 9:30-11:30, 13:00-15:00")
     print("执行模式: 循环执行（上一轮完成后立即开始下一轮）")
     print("超时时间: 20分钟")
     print("=" * 60)
