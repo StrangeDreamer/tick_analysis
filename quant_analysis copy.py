@@ -8,6 +8,7 @@ import os
 import warnings
 import sys
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 # 在导入其他库之前抑制所有警告（包括 urllib3 的 OpenSSL 警告）
 warnings.filterwarnings('ignore')
@@ -31,7 +32,6 @@ from datetime import datetime, timedelta
 import requests
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import base64
 import hmac
@@ -44,28 +44,19 @@ class QuantAnalysis:
         self.tick_data = {}
         self.trade_directions = {}
         self.scores = {}
-        self.max_workers = 10
+        self.max_workers = 5  # 降低并发数
         self.cache_file = "hot_stocks_cache.json"
-
-    def get_accurate_previous_close(self, symbol):
-        """通过实时接口获取准确的昨日收盘价（已考虑复权因子）"""
-        try:
-            clean_code = symbol.replace('SH', '').replace('SZ', '')
-            df = ak.stock_zh_a_spot_em()
-            row = df[df['代码'] == clean_code]
-            if not row.empty:
-                return float(row['昨收'].iloc[0])
-        except:
-            pass
-        return None
 
     def _get_stock_name_by_code(self, code):
         """根据股票代码获取股票名称"""
-        spot_df = ak.stock_zh_a_spot()
-        if spot_df is not None and not spot_df.empty:
-            stock_row = spot_df[spot_df['代码'] == code]
-            if not stock_row.empty and '名称' in stock_row.columns:
-                return stock_row['名称'].iloc[0]
+        try:
+            spot_df = ak.stock_zh_a_spot()
+            if spot_df is not None and not spot_df.empty:
+                stock_row = spot_df[spot_df['代码'] == code]
+                if not stock_row.empty and '名称' in stock_row.columns:
+                    return stock_row['名称'].iloc[0]
+        except Exception:
+            pass
         
         try:
             info_df = ak.stock_individual_info_em(symbol=code)
@@ -75,7 +66,7 @@ class QuantAnalysis:
                     stock_name = name_row['value'].iloc[0]
                     if stock_name and pd.notna(stock_name):
                         return str(stock_name).strip()
-        except:
+        except Exception:
             pass
         
         return f'股票{code}'
@@ -105,87 +96,6 @@ class QuantAnalysis:
         
         return stocks
 
-    def _get_single_stock_realtime_info(self, symbol):
-        """获取单只股票的实时价格"""
-        clean_symbol = symbol.replace('SH', '').replace('SZ', '')
-        
-        try:
-            minute_symbol = f'sh{clean_symbol}' if clean_symbol.startswith('6') else f'sz{clean_symbol}'
-            minute_df = ak.stock_zh_a_minute(symbol=minute_symbol, period='1', adjust='qfq')
-            if minute_df is not None and not minute_df.empty and 'close' in minute_df.columns:
-                return {'最新价': float(minute_df['close'].iloc[-1])}
-        except:
-            pass
-        
-        try:
-            hist_df = ak.stock_zh_a_hist(symbol=clean_symbol, period='daily', adjust='qfq')
-            if hist_df is not None and not hist_df.empty:
-                return {'最新价': float(hist_df['收盘'].iloc[-1])}
-        except:
-            pass
-        
-        return {'最新价': 10.0}
-
-    def get_stock_price_batch(self, stock_codes):
-        """批量获取股票价格（使用实时行情接口，一次性获取所有股票）"""
-        if not stock_codes:
-            return {}, {}
-        
-        print(f"💰 开始获取 {len(stock_codes)} 只股票的价格（使用 ak.stock_zh_a_spot_em() 接口，一次性获取）...")
-        
-        price_data = {}
-        previous_close_data = {}  # 上一交易日收盘价数据
-        successful_count = 0
-        failed_count = 0
-        
-        code_map = { (code[2:] if code.startswith(('SH', 'SZ')) else code): code for code in stock_codes }
-        
-        try:
-            spot_df = ak.stock_zh_a_spot_em()
-            
-            if spot_df is not None and not spot_df.empty:
-                for pure_code, full_code in code_map.items():
-                    try:
-                        stock_row = spot_df[spot_df['代码'] == pure_code]
-                        
-                        if not stock_row.empty:
-                            price = None
-                            price_keys = ['最新价', '现价', 'current_price', 'price']
-                            for k in price_keys:
-                                if k in stock_row.columns:
-                                    try:
-                                        price = float(stock_row[k].iloc[0])
-                                        break
-                                    except: continue
-                            
-                            previous_close = None
-                            close_keys = ['昨收', 'pre_close', 'yesterday_close', '前收盘']
-                            for k in close_keys:
-                                if k in stock_row.columns:
-                                    try:
-                                        previous_close = float(stock_row[k].iloc[0])
-                                        break
-                                    except: continue
-                            
-                            if price is not None:
-                                price_data[full_code] = price
-                                previous_close_data[full_code] = previous_close if previous_close is not None else price
-                                successful_count += 1
-                            else:
-                                failed_count += 1
-                        else:
-                            failed_count += 1
-                    except Exception:
-                        failed_count += 1
-                
-                print(f"📊 价格获取完成: 成功 {successful_count} 只，失败 {failed_count} 只")
-            else:
-                print(f"❌ 无法获取实时行情数据")
-            return price_data, previous_close_data
-        except Exception as e:
-            print(f"❌ 获取价格数据失败: {e}")
-            return {}, {}
-
     def get_hot_stocks(self):
         """获取当日最热的沪深主板非ST A股股票，带每日缓存"""
         today_str = datetime.now().strftime('%Y-%m-%d')
@@ -212,12 +122,10 @@ class QuantAnalysis:
             print("❌ 热门股票排行榜数据为空")
             return []
 
-        # 定义筛选条件
         is_main_board = hot_rank_df['代码'].str.startswith(('SZ000', 'SZ001', 'SZ002', 'SH600', 'SH601', 'SH603', 'SH605'))
         is_not_st = ~hot_rank_df['股票名称'].str.contains('ST')
         is_price_ok = (hot_rank_df['最新价'] >= 5) & (hot_rank_df['最新价'] <= 30)
         
-        # 应用筛选
         filtered_stocks_df = hot_rank_df[is_main_board & is_not_st & is_price_ok].copy()
         
         print(f"📊 筛选结果: {len(hot_rank_df)}只 → {len(filtered_stocks_df)}只")
@@ -225,7 +133,6 @@ class QuantAnalysis:
         print(f"   - 非ST股票: ✓")
         print(f"   - 价格5-30元: ✓")
 
-        # 找出被剔除的股票并分析原因
         rejected_df = hot_rank_df[~(is_main_board & is_not_st & is_price_ok)]
         if not rejected_df.empty:
             print("\n🔍 被剔除股票随机抽样分析:")
@@ -241,9 +148,7 @@ class QuantAnalysis:
                 
                 print(f"  - {row['代码']} {row['股票名称']}: 被剔除，原因: {', '.join(reasons)}")
         
-        # 转换为字典格式
         final_stocks = filtered_stocks_df.to_dict('records')
-        
         final_stocks = self._fill_missing_stock_names(final_stocks)
         
         if final_stocks:
@@ -280,71 +185,58 @@ class QuantAnalysis:
         return unique_stocks
 
     def get_tick_data(self, symbol, date=None):
-        """获取股票的tick数据"""
-        if symbol.startswith(('SH', 'SZ')):
-            tick_symbol = symbol.lower()
-        elif symbol.startswith('6'):
-            tick_symbol = f'sh{symbol}'
-        elif symbol.startswith(('0', '3')):
-            tick_symbol = f'sz{symbol}'
-        else:
-            tick_symbol = symbol
+        """获取并处理股票的tick数据"""
+        tick_symbol = symbol.lower() if symbol.startswith(('SH', 'SZ')) else (f'sh{symbol}' if symbol.startswith('6') else f'sz{symbol}')
         
         print(f"  获取 {symbol} ({tick_symbol}) 的tick数据...")
         
         try:
             tick_df = ak.stock_zh_a_tick_tx_js(symbol=tick_symbol)
         except Exception as e:
-            print(f"  ❌ 获取 {symbol} tick数据时出错: {e}")
-            return None
+            # 在工作线程中捕获异常，以便超时可以工作
+            raise e
 
         if tick_df is None or tick_df.empty:
             print(f"  ❌ {symbol} 未获取到tick数据")
             return None
 
-        print(f"  成功获取 {len(tick_df)} 条tick数据")
+        print(f"  成功获取 {len(tick_df)} 条原始tick数据")
         
         tick_df = tick_df.rename(columns={
-            '成交时间': '时间', '成交价格': '成交价', '价格变动': '价格变动',
-            '成交量': '成交量', '成交金额': '成交额', '性质': '买卖盘性质'
+            '成交时间': '时间', '成交价格': '成交价', '成交量': '成交量', '性质': '买卖盘性质'
         })
         
+        tick_df = tick_df[['时间', '成交价', '成交量', '买卖盘性质']]
         tick_df['时间'] = pd.to_datetime(tick_df['时间'])
         tick_df = tick_df.sort_values('时间')
         
-        tick_df['dp'] = tick_df['价格变动']
-        tick_df['w1'] = np.tanh(np.abs(tick_df['dp']) / 0.01) * np.sign(tick_df['dp'])
-        tick_df['meanV'] = tick_df['成交量'].rolling(20, min_periods=1).mean()
-        tick_df['w2'] = np.minimum(1, tick_df['成交量'] / (3 * tick_df['meanV']))
-        alpha = 2 / 6
-        tick_df['prob'] = (tick_df['w1'] * tick_df['w2']).ewm(alpha=alpha, adjust=False).mean()
-        tick_df['mf'] = tick_df['prob'] * tick_df['成交额']
-        
-        tick_df['买卖盘性质'] = np.where(tick_df['mf'] < 0, '卖盘', '买盘')
-        tick_df['成交量'] = (np.abs(tick_df['mf']) / tick_df['成交价'] / 100).round().astype(int)
-        tick_df['成交额'] = np.abs(tick_df['mf']).round().astype(int)
+        original_len = len(tick_df)
+        tick_df = tick_df[tick_df['买卖盘性质'].isin(['买盘', '卖盘'])].copy()
+        print(f"  过滤中性盘: {original_len}条 → {len(tick_df)}条")
+
+        # akshare接口返回的成交量单位已经是“手”，无需转换
+        tick_df['成交量'] = tick_df['成交量'].astype(int)
         
         original_len = len(tick_df)
         tick_df = tick_df[tick_df['成交量'] > 0].copy()
         if original_len > len(tick_df):
-            print(f"  过滤无效数据: {original_len}条 → {len(tick_df)}条")
+            print(f"  过滤成交量为0的记录: {original_len}条 → {len(tick_df)}条")
         
         if tick_df.empty:
             print(f"  ⚠️ {symbol} 过滤后数据为空，返回None")
             return None
         
-        # 打印最新的5条tick数据
         print(f"  最新5条Tick数据 for {symbol}:")
         for _, row in tick_df.tail(5).iterrows():
             print(f"    {row['时间'].strftime('%H:%M:%S')} - 价格: {row['成交价']:.2f}, 成交量: {row['成交量']}手, 性质: {row['买卖盘性质']}")
 
-        return tick_df[['时间', '成交价', '成交量', '成交额', '买卖盘性质', 'meanV', 'w2', 'prob', 'mf']]
+        return tick_df
 
     def get_tick_data_worker(self, symbol):
         """多线程工作函数：获取单只股票的tick数据"""
         return symbol, self.get_tick_data(symbol)
 
-    def get_tick_data_batch(self, symbols, max_workers=10):
+    def get_tick_data_batch(self, symbols, max_workers=5):
         print(f"🚀 开始多线程获取 {len(symbols)} 只股票的tick数据（{max_workers}个线程）...")
         tick_data_results = {}
         successful_count = 0
@@ -356,13 +248,17 @@ class QuantAnalysis:
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
-                    _, tick_df = future.result()
+                    _, tick_df = future.result(timeout=15)
                     if tick_df is not None:
                         tick_data_results[symbol] = tick_df
                         successful_count += 1
                     else:
                         failed_count += 1
-                except Exception:
+                except TimeoutError:
+                    print(f"  ❌ {symbol} 获取数据超时 (超过15秒)")
+                    failed_count += 1
+                except Exception as e:
+                    print(f"  ❌ {symbol} 获取数据时发生错误: {e}")
                     failed_count += 1
         
         print(f"📊 批量获取完成: 成功 {successful_count} 只，失败 {failed_count} 只")
@@ -375,18 +271,16 @@ class QuantAnalysis:
         
         total_trades = len(tick_df)
         buy_mask = tick_df['买卖盘性质'] == '买盘'
-        sell_mask = tick_df['买卖盘性质'] == '卖盘'
         
         buy_count = buy_mask.sum()
-        sell_count = sell_mask.sum()
         
         buy_volume = tick_df.loc[buy_mask, '成交量'].sum()
-        sell_volume = tick_df.loc[sell_mask, '成交量'].sum()
+        sell_volume = tick_df.loc[~buy_mask, '成交量'].sum()
         total_volume = buy_volume + sell_volume
         
         return {
             'buy_ratio': buy_count / total_trades if total_trades > 0 else 0,
-            'sell_ratio': sell_count / total_trades if total_trades > 0 else 0,
+            'sell_ratio': (total_trades - buy_count) / total_trades if total_trades > 0 else 0,
             'net_buy_volume': buy_volume - sell_volume,
             'active_buy_ratio': buy_volume / total_volume if total_volume > 0 else 0.5,
             'active_sell_ratio': sell_volume / total_volume if total_volume > 0 else 0.5,
@@ -401,13 +295,13 @@ class QuantAnalysis:
             return 0
             
         active_buy_ratio = trade_direction['active_buy_ratio']
-        buy_sell_score = (active_buy_ratio - 0.5) * 2 * 70  # Scale to [-70, 70]
+        buy_sell_score = (active_buy_ratio - 0.5) * 2 * 70
         
         net_buy_volume = trade_direction['net_buy_volume']
         avg_volume = tick_df['成交量'].mean()
         net_buy_score = 0
         if avg_volume > 0:
-            net_buy_score = np.clip(net_buy_volume / (avg_volume * 10), -15, 15) * 2 # Scale to [-30, 30]
+            net_buy_score = np.clip(net_buy_volume / (avg_volume * 10), -15, 15) * 2
         
         score = buy_sell_score * 0.7 + net_buy_score * 0.3
         return score
@@ -474,7 +368,6 @@ class QuantAnalysis:
         
         print(f"✅ 步骤2完成: {len(analysis_results)} 只股票分析成功")
         
-        # 合并和排序
         for symbol, analysis in analysis_results.items():
             self.tick_data[symbol] = analysis['tick_df']
             self.trade_directions[symbol] = analysis['trade_direction']
