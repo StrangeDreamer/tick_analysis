@@ -9,6 +9,7 @@ import warnings
 import sys
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+import time
 
 # 在导入其他库之前抑制所有警告（包括 urllib3 的 OpenSSL 警告）
 warnings.filterwarnings('ignore')
@@ -35,7 +36,6 @@ import threading
 import hashlib
 import base64
 import hmac
-import time
 import argparse
 
 class QuantAnalysis:
@@ -229,7 +229,7 @@ class QuantAnalysis:
         print(f"\n  最新5条Tick数据 for {symbol}:")
         for _, row in tick_df.tail(5).iterrows():
             print(f"    {row['时间'].strftime('%H:%M:%S')} - 价格: {row['成交价']:.2f}, 成交量: {row['成交量']}手, 性质: {row['买卖盘性质']}")
-        
+
         return tick_df
 
     def get_tick_data_worker(self, symbol):
@@ -240,16 +240,12 @@ class QuantAnalysis:
         print(f"🚀 开始多线程获取 {len(symbols)} 只股票的tick数据（{max_workers}个线程）...")
         tick_data_results = {}
         
-        # 创建一个线程池
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 提交所有任务到线程池，并创建一个future到symbol的映射
             future_to_symbol = {executor.submit(self.get_tick_data_worker, symbol): symbol for symbol in symbols}
             
-            # 使用as_completed迭代已完成的future，实现实时进度更新
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
-                    # 获取任务结果，设置15秒超时
                     _, tick_df = future.result(timeout=15)
                     if tick_df is not None:
                         tick_data_results[symbol] = tick_df
@@ -358,6 +354,10 @@ class QuantAnalysis:
         symbols = [stock['代码'] for stock in all_stocks]
         historical_metrics = self._get_historical_data_batch(symbols)
         
+        # 礼貌性延迟，防止API限流
+        print("⏳ 礼貌性延迟5秒，防止触发API限流...")
+        time.sleep(5)
+
         print(f"📊 步骤1/3: 批量获取 {len(symbols)} 只股票的Tick数据...")
         tick_data_results = self.get_tick_data_batch(symbols, max_workers=self.max_workers)
         
