@@ -39,7 +39,7 @@ def run_analysis():
     """执行量化分析 - 直接导入模块调用"""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        module_path = os.path.join(script_dir, "quant_analysis copy.py")
+        module_path = os.path.join(script_dir, "quant_analysis.py")
         
         spec = importlib.util.spec_from_file_location("quant_analysis_copy", module_path)
         if spec is None or spec.loader is None:

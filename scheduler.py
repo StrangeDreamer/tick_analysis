@@ -47,8 +47,8 @@ def run_quant_analysis():
         script_dir = os.path.dirname(os.path.abspath(__file__))
         os.chdir(script_dir)
         
-        # 动态导入 quant_analysis copy.py 模块（因为文件名包含空格）
-        module_path = os.path.join(script_dir, "quant_analysis copy.py")
+        # 动态导入 quant_analysis.py 模块（因为文件名包含空格）
+        module_path = os.path.join(script_dir, "quant_analysis.py")
         
         spec = importlib.util.spec_from_file_location("quant_analysis_copy", module_path)
         if spec is None or spec.loader is None:
