@@ -51,11 +51,19 @@ class QuantAnalysis:
     def _get_market_performance(self):
         """获取大盘表现作为基准"""
         try:
-            market_df = ak.stock_zh_index_spot_em(symbol="sh000001")
-            if not market_df.empty:
-                market_change_pct = market_df['涨跌幅'].iloc[0]
+            # 使用您指定的、正确的接口获取上证指数数据
+            market_df = ak.stock_individual_spot_xq(symbol="SH000001")
+            
+            # 从返回的DataFrame中正确提取“涨幅”
+            change_row = market_df[market_df['item'] == '涨幅']
+            
+            if not change_row.empty:
+                market_change_pct = change_row['value'].iloc[0]
                 print(f"📈 大盘基准 (上证指数): {market_change_pct:.2f}%")
-                return market_change_pct
+                return float(market_change_pct)
+            else:
+                print("⚠️ 在返回数据中未找到'涨幅'项")
+                return 0.0
         except Exception as e:
             print(f"⚠️ 无法获取大盘表现: {e}")
         return 0.0
