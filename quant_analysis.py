@@ -226,6 +226,11 @@ class QuantAnalysis:
         if tick_df.empty:
             return None
         
+        # 打印最新的5条tick数据
+        print(f"\n  最新5条Tick数据 for {symbol}:")
+        for _, row in tick_df.tail(5).iterrows():
+            print(f"    {row['时间'].strftime('%H:%M:%S')} - 价格: {row['成交价']:.2f}, 成交量: {row['成交量']}手, 性质: {row['买卖盘性质']}")
+
         return tick_df
 
     def get_tick_data_worker(self, symbol):
@@ -235,10 +240,10 @@ class QuantAnalysis:
     def get_tick_data_batch(self, symbols, max_workers=5):
         print(f"🚀 开始多线程获取 {len(symbols)} 只股票的tick数据（{max_workers}个线程）...")
         tick_data_results = {}
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_symbol = {executor.submit(self.get_tick_data_worker, symbol): symbol for symbol in symbols}
-            
+
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
