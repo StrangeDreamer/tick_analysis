@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-量化分析系统：热门股票分析 (模型 V6.1 - 优化数据同步性)
+量化分析系统：热门股票分析 (模型 V6.2 - Z-score分层筛选)
 """
 
 import os
@@ -324,7 +324,7 @@ class QuantAnalysis:
         })
 
     def analyze_stocks(self):
-        """分析所有热门股票 (V6.1流程)"""
+        """分析所有热门股票 (V6.2流程)"""
         market_performance = self._get_market_performance()
         all_stocks = self.get_hot_stocks()
         if not all_stocks: return []
@@ -372,36 +372,63 @@ class QuantAnalysis:
         
         sorted_stocks = sorted(analysis_results.items(), key=lambda x: x[1]['score'], reverse=True)
         
+        # 动态设定涨幅限制
         if market_performance > 1.0:
-            max_change_limit = 8.5
-            print(f"ℹ️ 市场强势，放宽涨幅限制至 {max_change_limit}%")
+            base_change_limit = 8.5
+            print(f"ℹ️ 市场强势，基础涨幅限制放宽至 {base_change_limit}%")
         elif market_performance < -1.0:
-            max_change_limit = 5.5
-            print(f"ℹ️ 市场弱势，收紧涨幅限制至 {max_change_limit}%")
+            base_change_limit = 5.5
+            print(f"ℹ️ 市场弱势，基础涨幅限制收紧至 {base_change_limit}%")
         else:
-            max_change_limit = 7.0
-            print(f"ℹ️ 市场震荡，维持标准涨幅限制 {max_change_limit}%")
+            base_change_limit = 7.0
+            print(f"ℹ️ 市场震荡，维持标准涨幅限制 {base_change_limit}%")
 
         final_stocks = []
+        print("\n🔬 开始最终筛选...")
         for symbol, data in sorted_stocks:
-            z_score_ok = data['model_version'] == 'V4' or (data['model_version'] == 'V5' and data['fund_flow_z_score'] > 0.5)
+            # 基础数据质量检查
+            if data['active_buy_ratio'] >= 1.0:
+                continue
+
+            # 量比检查
             volume_ratio_ok = data.get('volume_ratio', 0) > 1.5 if volume_ratios else True
+            if not volume_ratio_ok:
+                continue
+
+            # 模型和涨幅分层检查
+            passed = False
+            if data['model_version'] == 'V5':
+                z_score = data['fund_flow_z_score']
+                # 强烈信号：Z-score > 2.5，给予更高涨幅容忍度
+                if z_score > 2.5:
+                    strong_signal_limit = base_change_limit + 1.5
+                    if data['intraday_change'] <= strong_signal_limit:
+                        print(f"  ✅ {symbol} (Z-score: {z_score:.2f}) 满足强烈信号，涨幅限制放宽至 {strong_signal_limit}%，通过。")
+                        passed = True
+                # 普通信号
+                elif z_score > 0.5:
+                    if data['intraday_change'] <= base_change_limit:
+                        passed = True
+            # V4备用模型
+            else:
+                if data['intraday_change'] <= base_change_limit:
+                    passed = True
             
-            if z_score_ok and volume_ratio_ok and data['intraday_change'] <= max_change_limit and data['active_buy_ratio'] < 1.0:
+            if passed:
                 final_stocks.append((symbol, data))
         
         print(f"\n✅ 分析完成，最终筛选出 {len(final_stocks)} 只股票")
         return final_stocks
 
     def send_dingtalk_message(self, top_stocks):
-        """发送钉钉消息 (V6.1格式)"""
+        """发送钉钉消息 (V6.2格式)"""
         webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=ae055118615b242c6fe43fc3273a228f316209f707d07e7ce39fc83f4270ed82"
         secret = "SECf2b2861525388e240846ad1e2beb3b93d3b5f0d2e6634e43176b593f050e77da"
         
         stocks_to_send = top_stocks[:50]
         if not stocks_to_send: return False
         
-        text = f"# 📈 量化分析报告 V6.1 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        text = f"# 📈 量化分析报告 V6.2 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         text += f"## 🏆 股票评分排序 (Top {len(stocks_to_send)})\n\n"
         
         for i, (symbol, data) in enumerate(stocks_to_send, 1):
@@ -420,7 +447,7 @@ class QuantAnalysis:
 - **价格冲击 (vs ATR20)**: {data['impact_atr_ratio']:.2%}
 """
         
-        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V6.1", "text": text}}
+        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V6.2", "text": text}}
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
@@ -441,7 +468,7 @@ class QuantAnalysis:
 
     def run_analysis(self):
         """运行完整分析流程"""
-        print("🔍 量化分析系统 V6.1 - 开始分析热门股票")
+        print("🔍 量化分析系统 V6.2 - 开始分析热门股票")
         top_stocks = self.analyze_stocks()
         
         if not top_stocks:
