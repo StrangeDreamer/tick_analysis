@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-量化分析系统：热门股票分析 (模型 V6.6 - 报告增加涨跌幅)
+量化分析系统：热门股票分析 (模型 V6.9 - 提高并发数)
 """
 
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import time
+import itertools
+import sys
 
 # 在导入其他库之前抑制所有警告
 warnings.filterwarnings('ignore')
@@ -29,7 +31,7 @@ import hmac
 
 class QuantAnalysis:
     def __init__(self):
-        self.max_workers = 5
+        self.max_workers = 10
         self.hot_stocks_cache_file = "hot_stocks_cache.json"
         self.historical_metrics_cache_file = "historical_metrics_cache.json"
         self.fund_flow_cache_file = "fund_flow_cache.json"
@@ -319,32 +321,43 @@ class QuantAnalysis:
             'volume_ratio': volume_ratio
         })
 
-    def analyze_stocks(self):
-        """分析所有热门股票 (V6.6流程)"""
-        market_performance = self._get_market_performance()
-        all_stocks = self.get_hot_stocks()
-        if not all_stocks: return []
-        
-        symbols = [stock['代码'] for stock in all_stocks]
-        
-        print("\n📊 步骤 1/4: 批量获取历史和资金流数据...")
-        historical_metrics = self._incremental_cache_batch_processor(symbols, self.historical_metrics_cache_file, self._get_historical_data, "历史行情")
-        fund_flow_data = self._incremental_cache_batch_processor(symbols, self.fund_flow_cache_file, self._get_fund_flow_with_history, "资金流")
-        
-        print("\n📊 步骤 2/4: 批量获取今日Tick数据...")
-        tick_data_results = self.get_tick_data_batch(symbols)
-        
-        print("\n📊 步骤 3/4: 获取全市场实时行情...")
+    def _get_realtime_quotes_worker(self):
+        """获取全市场实时行情的工作函数"""
         try:
             spot_df = ak.stock_zh_a_spot_em()
             spot_df['代码'] = spot_df['代码'].apply(lambda x: f"SH{x}" if x.startswith('6') else f"SZ{x}")
             volume_ratios = spot_df.set_index('代码')['量比'].to_dict()
             current_prices = spot_df.set_index('代码')['最新价'].to_dict()
             change_pcts = spot_df.set_index('代码')['涨跌幅'].to_dict()
-            print(f"✅ 成功获取 {len(volume_ratios)} 只股票的实时行情")
+            return volume_ratios, current_prices, change_pcts
         except Exception as e:
-            print(f"❌ 获取实时行情失败: {e}，部分数据将缺失")
-            volume_ratios, current_prices, change_pcts = {}, {}, {}
+            print(f"\n❌ 获取实时行情失败: {e}")
+            return {}, {}, {}
+
+    def analyze_stocks(self):
+        """分析所有热门股票 (V6.9流程)"""
+        market_performance = self._get_market_performance()
+        all_stocks = self.get_hot_stocks()
+        if not all_stocks: return []
+        
+        symbols = [stock['代码'] for stock in all_stocks]
+        
+        print("\n📊 步骤 1/3: 批量获取历史和资金流数据...")
+        historical_metrics = self._incremental_cache_batch_processor(symbols, self.historical_metrics_cache_file, self._get_historical_data, "历史行情")
+        fund_flow_data = self._incremental_cache_batch_processor(symbols, self.fund_flow_cache_file, self._get_fund_flow_with_history, "资金流")
+        
+        print("\n📊 步骤 2/3: 并行获取Tick数据和实时行情...")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            tick_future = executor.submit(self.get_tick_data_batch, symbols)
+            realtime_future = executor.submit(self._get_realtime_quotes_worker)
+            
+            tick_data_results = tick_future.result()
+            volume_ratios, current_prices, change_pcts = realtime_future.result()
+
+        if volume_ratios:
+            print(f"✅ 成功获取 {len(volume_ratios)} 只股票的实时行情")
+        else:
+            print("❌ 获取实时行情失败，将跳过量比筛选和价格显示")
 
         valid_stocks = []
         stock_dict = {s['代码']: s for s in all_stocks}
@@ -364,7 +377,7 @@ class QuantAnalysis:
         
         if not valid_stocks: return []
         
-        print("\n📊 步骤 4/4: 批量分析并计算得分...")
+        print("\n📊 步骤 3/3: 批量分析并计算得分...")
         analysis_results = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [executor.submit(self.analyze_stock_worker, s, df, market_performance, hm, ffd, vr, cp, chg) for s, df, hm, ffd, vr, cp, chg in valid_stocks]
@@ -385,14 +398,14 @@ class QuantAnalysis:
         return final_stocks
 
     def send_dingtalk_message(self, top_stocks):
-        """发送钉钉消息 (V6.6格式)"""
+        """发送钉钉消息 (V6.9格式)"""
         webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=ae055118615b242c6fe43fc3273a228f316209f707d07e7ce39fc83f4270ed82"
         secret = "SECf2b2861525388e240846ad1e2beb3b93d3b5f0d2e6634e43176b593f050e77da"
         
         stocks_to_send = top_stocks[:50]
         if not stocks_to_send: return False
         
-        text = f"# 📈 量化分析报告 V6.6 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        text = f"# 📈 量化分析报告 V6.9 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         text += f"## 🏆 股票评分排序 (Top {len(stocks_to_send)})\n\n"
         
         for i, (symbol, data) in enumerate(stocks_to_send, 1):
@@ -410,13 +423,13 @@ class QuantAnalysis:
             else:
                 z_score_line = f"- **主动买入强度**: {data['active_buy_ratio']:.1%}\n"
 
-            text += f"""{title_line}{score_line}{z_score_line}- **量比**: {data.get('volume_ratio', 'N/A'):.2f}
+            text += f"""{title_line}{score_line}- **量比**: {data.get('volume_ratio', 'N/A'):.2f}
 - **日内涨跌**: {data['intraday_change']:.2f}% (超额: {data['excess_return']:.2f}%)
 - **净买入占比 (vs ADV20)**: {data['net_buy_adv_ratio']:.2%}
 - **价格冲击 (vs ATR20)**: {data['impact_atr_ratio']:.2%}
 """
         
-        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V6.6", "text": text}}
+        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V6.9", "text": text}}
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
@@ -437,7 +450,7 @@ class QuantAnalysis:
 
     def run_analysis(self):
         """运行完整分析流程"""
-        print("🔍 量化分析系统 V6.6 - 开始分析热门股票")
+        print("🔍 量化分析系统 V6.9 - 开始分析热门股票")
         top_stocks = self.analyze_stocks()
         
         if not top_stocks:
