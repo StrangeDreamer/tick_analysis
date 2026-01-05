@@ -194,47 +194,70 @@ class QuantAnalysis:
         print(f"✅ 共获取 {len(unique_stocks)} 只待分析股票")
         return unique_stocks
 
-    def get_tick_data(self, symbol, date=None):
-        """获取并处理股票的tick数据"""
-        tick_symbol = symbol.lower() if symbol.startswith(('SH', 'SZ')) else (f'sh{symbol}' if symbol.startswith('6') else f'sz{symbol}')
-        
-        try:
-            tick_df = ak.stock_zh_a_tick_tx_js(symbol=tick_symbol)
-        except Exception as e:
-            raise e
+    def get_tick_data(self, symbol):
+        """获取并处理股票的tick数据，增加备用数据源"""
+        tick_df = None
+        source = "未知"
 
+        # 1. Primary source: Tencent
+        try:
+            tick_symbol = symbol.lower()  # tx_js needs 'sh' or 'sz' prefix
+            tick_df = ak.stock_zh_a_tick_tx_js(symbol=tick_symbol)
+            if tick_df is None or tick_df.empty:
+                raise ValueError("Empty DataFrame from Tencent")
+            
+            source = "腾讯"
+            tick_df = tick_df.rename(columns={
+                '成交时间': '时间', '成交价格': '成交价', '成交量': '成交量',
+                '性质': '买卖盘性质', '价格变动': '价格变动'
+            })
+            
+        except Exception:
+            try:
+                # 2. Fallback source: East Money
+                pure_symbol = symbol[2:]  # em needs pure code
+                tick_df = ak.stock_intraday_em(symbol=pure_symbol)
+                if tick_df is None or tick_df.empty:
+                    raise ValueError("Empty DataFrame from East Money")
+
+                source = "东方财富"
+                tick_df = tick_df.rename(columns={'性质': '买卖盘性质'})
+                tick_df['价格变动'] = tick_df['成交价'].diff().fillna(0)
+
+            except Exception:
+                return None, source
+
+        # --- Common processing for both data sources ---
         if tick_df is None or tick_df.empty:
-            return None
-        
-        tick_df = tick_df.rename(columns={
-            '成交时间': '时间', '成交价格': '成交价', '成交量': '成交量', 
-            '性质': '买卖盘性质', '价格变动': '价格变动'
-        })
-        
-        tick_df = tick_df[['时间', '成交价', '成交量', '买卖盘性质', '价格变动']]
+            return None, source
+
+        required_cols = ['时间', '成交价', '成交量', '买卖盘性质', '价格变动']
+        if not all(col in tick_df.columns for col in required_cols):
+            return None, source
+            
+        tick_df = tick_df[required_cols].copy()
         tick_df['时间'] = pd.to_datetime(tick_df['时间'])
         tick_df = tick_df.sort_values('时间')
         
         tick_df = tick_df[tick_df['买卖盘性质'].isin(['买盘', '卖盘'])].copy()
+        if tick_df.empty:
+            return None, source
+
         tick_df['成交量'] = tick_df['成交量'].astype(int)
         
-        tick_df.loc[tick_df['成交量'] > 0, 'price_impact'] = tick_df['价格变动'] / tick_df['成交量']
+        tick_df = tick_df[tick_df['成交量'] > 0].copy()
+        if tick_df.empty:
+            return None, source
+
+        tick_df.loc[:, 'price_impact'] = tick_df['价格变动'] / tick_df['成交量']
         tick_df['price_impact'].fillna(0, inplace=True)
 
-        tick_df = tick_df[tick_df['成交量'] > 0].copy()
-        
-        if tick_df.empty:
-            return None
-        
-        print(f"\n  最新5条Tick数据 for {symbol}:")
-        for _, row in tick_df.tail(5).iterrows():
-            print(f"    {row['时间'].strftime('%H:%M:%S')} - 价格: {row['成交价']:.2f}, 成交量: {row['成交量']}手, 性质: {row['买卖盘性质']}")
-
-        return tick_df
+        return tick_df, source
 
     def get_tick_data_worker(self, symbol):
         """多线程工作函数：获取单只股票的tick数据"""
-        return symbol, self.get_tick_data(symbol)
+        tick_df, source = self.get_tick_data(symbol)
+        return symbol, tick_df, source
 
     def get_tick_data_batch(self, symbols, max_workers=5):
         print(f"🚀 开始多线程获取 {len(symbols)} 只股票的tick数据（{max_workers}个线程）...")
@@ -243,16 +266,23 @@ class QuantAnalysis:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_symbol = {executor.submit(self.get_tick_data_worker, symbol): symbol for symbol in symbols}
             
+            count = 0
             for future in as_completed(future_to_symbol):
+                count += 1
                 symbol = future_to_symbol[future]
+                progress = f"({count}/{len(symbols)})"
                 try:
-                    _, tick_df = future.result(timeout=15)
+                    _, tick_df, source = future.result(timeout=15)
                     if tick_df is not None:
                         tick_data_results[symbol] = tick_df
+                        print(f"  {progress} ✅ {symbol} 获取成功 (来源: {source})")
+                    else:
+                        print(f"  {progress} ❌ {symbol} 获取失败 (尝试了 {source})")
+
                 except TimeoutError:
-                    print(f"  ❌ {symbol} 获取tick数据超时")
+                    print(f"  {progress} ❌ {symbol} 获取tick数据超时")
                 except Exception as e:
-                    print(f"  ❌ {symbol} 获取tick数据时发生错误: {e}")
+                    print(f"  {progress} ❌ {symbol} 获取tick数据时发生错误: {e}")
         
         return tick_data_results
 
