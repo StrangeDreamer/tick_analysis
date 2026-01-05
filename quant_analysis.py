@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-量化分析系统：热门股票分析 (模型 V6.2 - Z-score分层筛选)
+量化分析系统：热门股票分析 (模型 V6.5 - 移除所有筛选)
 """
 
 import os
@@ -75,11 +75,9 @@ class QuantAnalysis:
             flow_df = ak.stock_individual_fund_flow(stock=pure_code, market=market)
             
             if flow_df is None or flow_df.empty:
-                # print(f"{log_prefix} ❌ 资金流API返回空数据") # 在批量运行时过于冗长
                 return None
 
             if len(flow_df) < 21:
-                # print(f"{log_prefix} ❌ 资金流数据仅 {len(flow_df)} 天，不足21天")
                 return None
             
             flow_df['日期'] = pd.to_datetime(flow_df['日期'])
@@ -276,7 +274,7 @@ class QuantAnalysis:
         total_score = buy_sell_score + net_buy_score + impact_score + momentum_score + alpha_score
         return np.clip(total_score, -100, 100)
 
-    def analyze_stock_worker(self, stock, tick_df, market_performance, hist_metrics, fund_flow_data, volume_ratio):
+    def analyze_stock_worker(self, stock, tick_df, market_performance, hist_metrics, fund_flow_data, volume_ratio, current_price):
         symbol = stock['代码']
         name = stock['股票名称']
         
@@ -316,6 +314,7 @@ class QuantAnalysis:
 
         return (symbol, {
             'name': name, 'score': score, 'model_version': model_version,
+            'current_price': current_price,
             'fund_flow_z_score': fund_flow_z_score,
             'net_buy_adv_ratio': net_buy_adv_ratio, 'impact_atr_ratio': impact_atr_ratio,
             'intraday_change': intraday_change, 'excess_return': excess_return,
@@ -324,7 +323,7 @@ class QuantAnalysis:
         })
 
     def analyze_stocks(self):
-        """分析所有热门股票 (V6.2流程)"""
+        """分析所有热门股票 (V6.5流程)"""
         market_performance = self._get_market_performance()
         all_stocks = self.get_hot_stocks()
         if not all_stocks: return []
@@ -338,21 +337,30 @@ class QuantAnalysis:
         print("\n📊 步骤 2/4: 批量获取今日Tick数据...")
         tick_data_results = self.get_tick_data_batch(symbols)
         
-        print("\n📊 步骤 3/4: 获取全市场实时行情(含量比)...")
+        print("\n📊 步骤 3/4: 获取全市场实时行情(含量比和股价)...")
         try:
             spot_df = ak.stock_zh_a_spot_em()
             spot_df['代码'] = spot_df['代码'].apply(lambda x: f"SH{x}" if x.startswith('6') else f"SZ{x}")
             volume_ratios = spot_df.set_index('代码')['量比'].to_dict()
-            print(f"✅ 成功获取 {len(volume_ratios)} 只股票的量比数据")
+            current_prices = spot_df.set_index('代码')['最新价'].to_dict()
+            print(f"✅ 成功获取 {len(volume_ratios)} 只股票的量比和股价数据")
         except Exception as e:
-            print(f"❌ 获取量比数据失败: {e}，将跳过量比筛选")
+            print(f"❌ 获取实时行情失败: {e}，将跳过量比筛选")
             volume_ratios = {}
+            current_prices = {}
 
         valid_stocks = []
         stock_dict = {s['代码']: s for s in all_stocks}
         for symbol, tick_df in tick_data_results.items():
             if symbol in historical_metrics:
-                valid_stocks.append((stock_dict[symbol], tick_df, historical_metrics[symbol], fund_flow_data.get(symbol), volume_ratios.get(symbol, 0)))
+                valid_stocks.append((
+                    stock_dict[symbol], 
+                    tick_df, 
+                    historical_metrics[symbol], 
+                    fund_flow_data.get(symbol), 
+                    volume_ratios.get(symbol, 0),
+                    current_prices.get(symbol, 0)
+                ))
             else:
                 print(f"  ⚠️ {symbol} ({stock_dict.get(symbol, {}).get('股票名称', '')}) 缺少必要的历史行情数据，跳过")
         
@@ -361,7 +369,7 @@ class QuantAnalysis:
         print("\n📊 步骤 4/4: 批量分析并计算得分...")
         analysis_results = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [executor.submit(self.analyze_stock_worker, s, df, market_performance, hm, ffd, vr) for s, df, hm, ffd, vr in valid_stocks]
+            futures = [executor.submit(self.analyze_stock_worker, s, df, market_performance, hm, ffd, vr, cp) for s, df, hm, ffd, vr, cp in valid_stocks]
             for f in as_completed(futures):
                 try:
                     symbol, result = f.result()
@@ -372,67 +380,27 @@ class QuantAnalysis:
         
         sorted_stocks = sorted(analysis_results.items(), key=lambda x: x[1]['score'], reverse=True)
         
-        # 动态设定涨幅限制
-        if market_performance > 1.0:
-            base_change_limit = 8.5
-            print(f"ℹ️ 市场强势，基础涨幅限制放宽至 {base_change_limit}%")
-        elif market_performance < -1.0:
-            base_change_limit = 5.5
-            print(f"ℹ️ 市场弱势，基础涨幅限制收紧至 {base_change_limit}%")
-        else:
-            base_change_limit = 7.0
-            print(f"ℹ️ 市场震荡，维持标准涨幅限制 {base_change_limit}%")
-
-        final_stocks = []
-        print("\n🔬 开始最终筛选...")
-        for symbol, data in sorted_stocks:
-            # 基础数据质量检查
-            if data['active_buy_ratio'] >= 1.0:
-                continue
-
-            # 量比检查
-            volume_ratio_ok = data.get('volume_ratio', 0) > 1.5 if volume_ratios else True
-            if not volume_ratio_ok:
-                continue
-
-            # 模型和涨幅分层检查
-            passed = False
-            if data['model_version'] == 'V5':
-                z_score = data['fund_flow_z_score']
-                # 强烈信号：Z-score > 2.5，给予更高涨幅容忍度
-                if z_score > 2.5:
-                    strong_signal_limit = base_change_limit + 1.5
-                    if data['intraday_change'] <= strong_signal_limit:
-                        print(f"  ✅ {symbol} (Z-score: {z_score:.2f}) 满足强烈信号，涨幅限制放宽至 {strong_signal_limit}%，通过。")
-                        passed = True
-                # 普通信号
-                elif z_score > 0.5:
-                    if data['intraday_change'] <= base_change_limit:
-                        passed = True
-            # V4备用模型
-            else:
-                if data['intraday_change'] <= base_change_limit:
-                    passed = True
-            
-            if passed:
-                final_stocks.append((symbol, data))
+        print("\n🔬 最终结果列表 (仅排序，无筛选)...")
+        final_stocks = list(sorted_stocks)
         
-        print(f"\n✅ 分析完成，最终筛选出 {len(final_stocks)} 只股票")
+        print(f"\n✅ 分析完成，最终生成 {len(final_stocks)} 只股票的排序列表")
         return final_stocks
 
     def send_dingtalk_message(self, top_stocks):
-        """发送钉钉消息 (V6.2格式)"""
+        """发送钉钉消息 (V6.5格式)"""
         webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=ae055118615b242c6fe43fc3273a228f316209f707d07e7ce39fc83f4270ed82"
         secret = "SECf2b2861525388e240846ad1e2beb3b93d3b5f0d2e6634e43176b593f050e77da"
         
         stocks_to_send = top_stocks[:50]
         if not stocks_to_send: return False
         
-        text = f"# 📈 量化分析报告 V6.2 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        text = f"# 📈 量化分析报告 V6.5 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         text += f"## 🏆 股票评分排序 (Top {len(stocks_to_send)})\n\n"
         
         for i, (symbol, data) in enumerate(stocks_to_send, 1):
             model_tag = f"({data['model_version']})"
+            price_str = f" - ¥{data.get('current_price', 'N/A'):.2f}" if data.get('current_price') else ""
+            title_line = f"### {i}. {data['name']} ({symbol}){price_str}\n"
             score_line = f"- **得分**: **{data['score']:.2f}** {model_tag}\n"
             
             if data['model_version'] == 'V5':
@@ -440,14 +408,13 @@ class QuantAnalysis:
             else:
                 z_score_line = f"- **主动买入强度**: {data['active_buy_ratio']:.1%}\n"
 
-            text += f"""### {i}. {data['name']} ({symbol})
-{score_line}{z_score_line}- **量比**: {data.get('volume_ratio', 'N/A'):.2f}
+            text += f"""{title_line}{score_line}- **量比**: {data.get('volume_ratio', 'N/A'):.2f}
 - **日内涨跌**: {data['intraday_change']:.2f}% (超额: {data['excess_return']:.2f}%)
 - **净买入占比 (vs ADV20)**: {data['net_buy_adv_ratio']:.2%}
 - **价格冲击 (vs ATR20)**: {data['impact_atr_ratio']:.2%}
 """
         
-        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V6.2", "text": text}}
+        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V6.5", "text": text}}
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
@@ -468,7 +435,7 @@ class QuantAnalysis:
 
     def run_analysis(self):
         """运行完整分析流程"""
-        print("🔍 量化分析系统 V6.2 - 开始分析热门股票")
+        print("🔍 量化分析系统 V6.5 - 开始分析热门股票")
         top_stocks = self.analyze_stocks()
         
         if not top_stocks:
