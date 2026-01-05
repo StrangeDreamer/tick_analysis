@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-量化分析系统：热门股票分析 (模型 V5.9 - Tick数据日志增强)
+量化分析系统：热门股票分析 (模型 V5.9 - 动态涨幅限制)
 """
 
 import os
@@ -326,7 +326,7 @@ class QuantAnalysis:
         })
 
     def analyze_stocks(self):
-        """分析所有热门股票 (V5.8流程)"""
+        """分析所有热门股票 (V5.9流程)"""
         market_performance = self._get_market_performance()
         all_stocks = self.get_hot_stocks()
         if not all_stocks: return []
@@ -364,24 +364,35 @@ class QuantAnalysis:
         
         sorted_stocks = sorted(analysis_results.items(), key=lambda x: x[1]['score'], reverse=True)
         
+        # 动态设定涨幅限制
+        if market_performance > 1.0:
+            max_change_limit = 8.5
+            print(f"ℹ️ 市场强势，放宽涨幅限制至 {max_change_limit}%")
+        elif market_performance < -1.0:
+            max_change_limit = 5.5
+            print(f"ℹ️ 市场弱势，收紧涨幅限制至 {max_change_limit}%")
+        else:
+            max_change_limit = 7.0
+            print(f"ℹ️ 市场震荡，维持标准涨幅限制 {max_change_limit}%")
+
         final_stocks = []
         for symbol, data in sorted_stocks:
             z_score_ok = data['model_version'] == 'V4' or (data['model_version'] == 'V5' and data['fund_flow_z_score'] > 0.5)
-            if z_score_ok and data['intraday_change'] <= 7.0 and data['active_buy_ratio'] < 1.0:
+            if z_score_ok and data['intraday_change'] <= max_change_limit and data['active_buy_ratio'] < 1.0:
                 final_stocks.append((symbol, data))
         
         print(f"\n✅ 分析完成，最终筛选出 {len(final_stocks)} 只股票")
         return final_stocks
 
     def send_dingtalk_message(self, top_stocks):
-        """发送钉钉消息 (V5.8格式)"""
+        """发送钉钉消息 (V5.9格式)"""
         webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=ae055118615b242c6fe43fc3273a228f316209f707d07e7ce39fc83f4270ed82"
         secret = "SECf2b2861525388e240846ad1e2beb3b93d3b5f0d2e6634e43176b593f050e77da"
         
         stocks_to_send = top_stocks[:50]
         if not stocks_to_send: return False
         
-        text = f"# 📈 量化分析报告 V5.8 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        text = f"# 📈 量化分析报告 V5.9 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         text += f"## 🏆 股票评分排序 (Top {len(stocks_to_send)})\n\n"
         
         for i, (symbol, data) in enumerate(stocks_to_send, 1):
@@ -399,7 +410,7 @@ class QuantAnalysis:
 - **价格冲击 (vs ATR20)**: {data['impact_atr_ratio']:.2%}
 """
         
-        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V5.8", "text": text}}
+        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V5.9", "text": text}}
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
@@ -420,7 +431,7 @@ class QuantAnalysis:
 
     def run_analysis(self):
         """运行完整分析流程"""
-        print("🔍 量化分析系统 V5.8 - 开始分析热门股票")
+        print("🔍 量化分析系统 V5.9 - 开始分析热门股票")
         top_stocks = self.analyze_stocks()
         
         if not top_stocks:
@@ -429,10 +440,43 @@ class QuantAnalysis:
         
         self.send_dingtalk_message(top_stocks)
 
+    def test_single_stock(self, symbol):
+        """诊断单只股票的数据获取流程"""
+        print(f"\n🔬 开始诊断单只股票: {symbol}\n")
+        
+        print("  - 步骤1: 获取历史行情 (ADV/ATR)...")
+        hist_data = self._get_historical_data(symbol)
+        if hist_data:
+            print(f"    ✅ 成功: {hist_data}")
+        else:
+            print("    ❌ 失败")
+
+        print("\n  - 步骤2: 获取资金流 (今日+历史)...")
+        fund_flow = self._get_fund_flow_with_history(symbol, thread_id="[诊断] ")
+        if fund_flow:
+            print(f"  [诊断] {symbol}: ✅ 资金流数据处理成功")
+        else:
+            print(f"  [诊断] {symbol}: ❌ 资金流数据处理失败")
+
+
+        print("\n  - 步骤3: 获取今日Tick数据...")
+        tick_data, source = self.get_tick_data(symbol)
+        if tick_data is not None and not tick_data.empty:
+            print(f"    ✅ 成功 (来源: {source}), 获取到 {len(tick_data)} 条记录")
+        else:
+            print(f"    ❌ 失败 (尝试了 {source})")
+        
+        print("\n🔬 诊断结束")
+
 def main():
-    """主函数"""
     analyzer = QuantAnalysis()
     analyzer.run_analysis()
+    
+    # --- 单股诊断工具 ---
+    # 1. 注释掉上面的 analyzer.run_analysis()
+    # 2. 取消下面的注释
+    # 3. 填入你想测试的股票代码
+    # analyzer.test_single_stock("SZ002413")
 
 if __name__ == "__main__":
     main()
