@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-量化分析系统：热门股票分析 (模型 V6.9 - 提高并发数)
+量化分析系统：热门股票分析 (模型 V7.2 - 修复空缓存问题)
 """
 
 import os
@@ -151,14 +151,18 @@ class QuantAnalysis:
         """获取当日最热的沪深主板非ST A股股票，带每日缓存"""
         today_str = datetime.now().strftime('%Y-%m-%d')
         cache_path = self.hot_stocks_cache_file
+        
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
                     if cache_data.get('date') == today_str:
                         stocks = cache_data.get('stocks', [])
-                        print(f"✅ 从缓存加载热门股票列表，共 {len(stocks)} 条记录")
-                        return stocks
+                        if stocks: # 检查缓存是否为空
+                            print(f"✅ 从缓存加载热门股票列表，共 {len(stocks)} 条记录")
+                            return stocks
+                        else:
+                            print("⚠️ 缓存的热门股列表为空，将重新从API获取")
             except (json.JSONDecodeError, IOError):
                 print(f"⚠️ {os.path.basename(cache_path)} 缓存文件损坏，将重新获取")
 
@@ -166,18 +170,26 @@ class QuantAnalysis:
         try:
             hot_rank_df = ak.stock_hot_rank_em()
             if hot_rank_df is None or hot_rank_df.empty: return []
+            
             is_main = hot_rank_df['代码'].str.startswith(('SZ00', 'SH60'))
             is_not_st = ~hot_rank_df['股票名称'].str.contains('ST')
             is_price_ok = (hot_rank_df['最新价'] >= 5) & (hot_rank_df['最新价'] <= 30)
             filtered_df = hot_rank_df[is_main & is_not_st & is_price_ok]
-            final_stocks = filtered_df.to_dict('records')
             
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump({'date': today_str, 'stocks': final_stocks}, f, ensure_ascii=False, indent=4)
-            print(f"💾 热门股票列表已缓存至 {os.path.basename(cache_path)}")
-        except IOError as e:
-            print(f"❌ 缓存热门股票列表失败: {e}")
-        return final_stocks
+            # 只保留代码和名称
+            final_stocks = filtered_df[['代码', '股票名称']].to_dict('records')
+            
+            if final_stocks:
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    json.dump({'date': today_str, 'stocks': final_stocks}, f, ensure_ascii=False, indent=4)
+                print(f"💾 热门股票列表已缓存至 {os.path.basename(cache_path)}")
+            else:
+                print("⚠️ 未获取到符合条件的热门股，不更新缓存")
+
+            return final_stocks
+        except Exception as e:
+            print(f"❌ 获取热门股票排行榜失败: {e}")
+            return []
 
     def get_tick_data(self, symbol, thread_id=""):
         """获取并处理股票的tick数据，增加备用数据源"""
@@ -335,7 +347,7 @@ class QuantAnalysis:
             return {}, {}, {}
 
     def analyze_stocks(self):
-        """分析所有热门股票 (V6.9流程)"""
+        """分析所有热门股票 (V7.2流程)"""
         market_performance = self._get_market_performance()
         all_stocks = self.get_hot_stocks()
         if not all_stocks: return []
@@ -398,14 +410,14 @@ class QuantAnalysis:
         return final_stocks
 
     def send_dingtalk_message(self, top_stocks):
-        """发送钉钉消息 (V6.9格式)"""
+        """发送钉钉消息 (V7.2格式)"""
         webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=ae055118615b242c6fe43fc3273a228f316209f707d07e7ce39fc83f4270ed82"
         secret = "SECf2b2861525388e240846ad1e2beb3b93d3b5f0d2e6634e43176b593f050e77da"
         
         stocks_to_send = top_stocks[:50]
         if not stocks_to_send: return False
         
-        text = f"# 📈 量化分析报告 V6.9 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        text = f"# 📈 量化分析报告 V7.2 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         text += f"## 🏆 股票评分排序 (Top {len(stocks_to_send)})\n\n"
         
         for i, (symbol, data) in enumerate(stocks_to_send, 1):
@@ -429,7 +441,7 @@ class QuantAnalysis:
 - **价格冲击 (vs ATR20)**: {data['impact_atr_ratio']:.2%}
 """
         
-        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V6.9", "text": text}}
+        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V7.2", "text": text}}
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
@@ -450,7 +462,7 @@ class QuantAnalysis:
 
     def run_analysis(self):
         """运行完整分析流程"""
-        print("🔍 量化分析系统 V6.9 - 开始分析热门股票")
+        print("🔍 量化分析系统 V7.2 - 开始分析热门股票")
         top_stocks = self.analyze_stocks()
         
         if not top_stocks:
