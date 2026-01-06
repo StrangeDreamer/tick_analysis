@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-量化分析系统：热门股票分析 (模型 V7.2 - 修复空缓存问题)
+量化分析系统：热门股票分析 (模型 V7.4 - 优化对倒交易识别)
 """
 
 import os
@@ -102,6 +102,7 @@ class QuantAnalysis:
         """通用增量更新缓存处理器"""
         today_str = datetime.now().strftime('%Y-%m-%d')
         cached_data = {}
+        cache_filename = os.path.basename(cache_path)
 
         if os.path.exists(cache_path):
             try:
@@ -109,9 +110,9 @@ class QuantAnalysis:
                     cache_file_content = json.load(f)
                     if cache_file_content.get('date') == today_str:
                         cached_data = cache_file_content.get('data', {})
-                        print(f"✅ 从缓存加载 {entity_name}，共 {len(cached_data)} 条记录")
+                        print(f"✅ 从缓存文件 '{cache_filename}' 加载 {entity_name}，共 {len(cached_data)} 条记录")
             except (json.JSONDecodeError, IOError):
-                print(f"⚠️ {os.path.basename(cache_path)} 缓存文件损坏，将重新获取")
+                print(f"⚠️ {cache_filename} 缓存文件损坏，将重新获取")
 
         missing_symbols = [s for s in symbols if s not in cached_data]
 
@@ -141,7 +142,7 @@ class QuantAnalysis:
             try:
                 with open(cache_path, 'w', encoding='utf-8') as f:
                     json.dump({'date': today_str, 'data': cached_data}, f, ensure_ascii=False, indent=4)
-                print(f"💾 {entity_name} 缓存已更新，总计 {len(cached_data)} 条记录")
+                print(f"💾 {entity_name} 缓存已更新至 '{cache_filename}'，总计 {len(cached_data)} 条记录")
             except IOError as e:
                 print(f"❌ 缓存 {entity_name} 失败: {e}")
         
@@ -151,44 +152,80 @@ class QuantAnalysis:
         """获取当日最热的沪深主板非ST A股股票，带每日缓存"""
         today_str = datetime.now().strftime('%Y-%m-%d')
         cache_path = self.hot_stocks_cache_file
-        
+        cache_filename = os.path.basename(cache_path)
+
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
                     if cache_data.get('date') == today_str:
                         stocks = cache_data.get('stocks', [])
-                        if stocks: # 检查缓存是否为空
-                            print(f"✅ 从缓存加载热门股票列表，共 {len(stocks)} 条记录")
+                        if stocks:  # 检查缓存是否为空
+                            print(f"✅ 从缓存文件 '{cache_filename}' 加载热门股票列表，共 {len(stocks)} 条记录")
                             return stocks
                         else:
-                            print("⚠️ 缓存的热门股列表为空，将重新从API获取")
+                            print(f"⚠️ 缓存的热门股列表为空，将重新从API获取")
             except (json.JSONDecodeError, IOError):
-                print(f"⚠️ {os.path.basename(cache_path)} 缓存文件损坏，将重新获取")
+                print(f"⚠️ {cache_filename} 缓存文件损坏，将重新获取")
 
         print("🔄 从API获取热门股票排行榜...")
+        hot_stock_codes = set()
+
+        # Source 1: East Money
         try:
             hot_rank_df = ak.stock_hot_rank_em()
-            if hot_rank_df is None or hot_rank_df.empty: return []
-            
-            is_main = hot_rank_df['代码'].str.startswith(('SZ00', 'SH60'))
-            is_not_st = ~hot_rank_df['股票名称'].str.contains('ST')
-            is_price_ok = (hot_rank_df['最新价'] >= 5) & (hot_rank_df['最新价'] <= 30)
-            filtered_df = hot_rank_df[is_main & is_not_st & is_price_ok]
-            
-            # 只保留代码和名称
-            final_stocks = filtered_df[['代码', '股票名称']].to_dict('records')
-            
+            if hot_rank_df is not None and not hot_rank_df.empty:
+                hot_stock_codes.update(hot_rank_df['代码'].tolist())
+                print(f"✅ 从东方财富获取 {len(hot_stock_codes)} 只热门股")
+        except Exception as e:
+            print(f"⚠️ 获取东方财富热门股失败: {e}")
+
+        # Source 2: Baidu Search
+        try:
+            baidu_date = datetime.now().strftime('%Y%m%d')
+            baidu_hot_df = ak.stock_hot_search_baidu(symbol="A股", date=baidu_date, time="今日")
+            if baidu_hot_df is not None and not baidu_hot_df.empty:
+                # The column is '股票代码'
+                baidu_codes = baidu_hot_df['股票代码'].tolist()
+                initial_count = len(hot_stock_codes)
+                hot_stock_codes.update(baidu_codes)
+                print(f"✅ 从百度热搜新增 {len(hot_stock_codes) - initial_count} 只热门股")
+        except Exception as e:
+            print(f"⚠️ 获取百度热搜股票失败: {e}")
+
+        if not hot_stock_codes:
+            print("❌ 未从任何来源获取到热门股")
+            return []
+
+        print(f"ℹ️ 合并后共 {len(hot_stock_codes)} 只热门股，开始进行筛选...")
+
+        try:
+            spot_df = ak.stock_zh_a_spot_em()
+            spot_df['代码'] = spot_df['代码'].apply(lambda x: f"SH{x}" if x.startswith('6') else f"SZ{x}")
+
+            # Filter the spot dataframe to only include our hot stocks
+            filtered_df = spot_df[spot_df['代码'].isin(hot_stock_codes)].copy()
+
+            is_main = filtered_df['代码'].str.startswith(('SZ00', 'SH60'))
+            is_not_st = ~filtered_df['名称'].str.contains('ST')
+            is_price_ok = (filtered_df['最新价'] >= 5) & (filtered_df['最新价'] <= 30)
+
+            final_df = filtered_df[is_main & is_not_st & is_price_ok]
+
+            # The column name for stock name is '名称' in spot_df
+            final_df = final_df.rename(columns={'名称': '股票名称'})
+            final_stocks = final_df[['代码', '股票名称']].to_dict('records')
+
             if final_stocks:
                 with open(cache_path, 'w', encoding='utf-8') as f:
                     json.dump({'date': today_str, 'stocks': final_stocks}, f, ensure_ascii=False, indent=4)
-                print(f"💾 热门股票列表已缓存至 {os.path.basename(cache_path)}")
+                print(f"💾 热门股票列表已缓存至 '{cache_filename}'，筛选后剩 {len(final_stocks)} 条")
             else:
                 print("⚠️ 未获取到符合条件的热门股，不更新缓存")
 
             return final_stocks
         except Exception as e:
-            print(f"❌ 获取热门股票排行榜失败: {e}")
+            print(f"❌ 获取实时行情进行筛选失败: {e}")
             return []
 
     def get_tick_data(self, symbol, thread_id=""):
@@ -211,7 +248,7 @@ class QuantAnalysis:
         if not all(c in tick_df.columns for c in ['时间', '成交价', '成交量', '买卖盘性质', '价格变动']): return None, source
         tick_df = tick_df[['时间', '成交价', '成交量', '买卖盘性质', '价格变动']].copy()
         tick_df['时间'] = pd.to_datetime(tick_df['时间'])
-        tick_df = tick_df.sort_values('时间')
+        tick_df = tick_df.sort_values('时间').reset_index(drop=True)
         tick_df = tick_df[tick_df['买卖盘性质'].isin(['买盘', '卖盘'])].copy()
         tick_df['成交量'] = tick_df['成交量'].astype(int)
         tick_df = tick_df[tick_df['成交量'] > 0].copy()
@@ -233,8 +270,6 @@ class QuantAnalysis:
                     if df is not None and not df.empty:
                         results[s] = df
                         print(f"{log_prefix} ✅ 获取Tick成功 (来源: {src})")
-                        for _, row in df.tail(3).iterrows():
-                            print(f"    {row['时间'].strftime('%H:%M:%S')} - 价格: {row['成交价']:.2f}, 成交量: {row['成交量']}手, 性质: {row['买卖盘性质']}")
                     else:
                         print(f"{log_prefix} ❌ 获取Tick失败")
                 except TimeoutError:
@@ -243,6 +278,83 @@ class QuantAnalysis:
                     print(f"{log_prefix} ❌ 获取Tick异常: {e}")
         print(f"✅ Tick数据获取完成，成功 {len(results)}/{len(symbols)} 只")
         return results
+
+    def _filter_wash_trades(self, tick_df, symbol, name):
+        """
+        识别并过滤3秒快照数据中的疑似对倒交易。
+        该方法检查两种模式：
+        1. 单笔Tick内的量价背离 (Intra-Tick Divergence): 巨大的成交量但价格无变化。
+        2. 连续Tick间的脉冲抵消 (Inter-Tick Cancellation): 连续两笔巨量Tick，性质相反，且价格变动相互抵消。
+        """
+        if tick_df is None or len(tick_df) < 20: # 需要足够数据来计算基准
+            return tick_df, 0
+
+        df = tick_df.copy()
+        total_volume = df['成交量'].sum()
+        if total_volume == 0:
+            return df, 0
+
+        # --- 定义基准 ---
+        rolling_window = 20
+        volume_mean = df['成交量'].rolling(window=rolling_window, min_periods=5).mean().fillna(df['成交量'].mean())
+        volume_std = df['成交量'].rolling(window=rolling_window, min_periods=5).std().fillna(df['成交量'].std())
+        volume_spike_threshold = volume_mean + 2 * volume_std
+        
+        is_wash_trade = pd.Series(False, index=df.index)
+
+        # --- 特征一：单笔Tick内的量价背离 ---
+        is_spike = df['成交量'] > volume_spike_threshold * 2 # 对单笔要求更高
+        is_no_price_change = df['价格变动'] == 0
+        feature1_mask = is_spike & is_no_price_change
+        is_wash_trade[feature1_mask] = True
+
+        # --- 特征二：连续Tick间的脉冲抵消 ---
+        for i in range(1, len(df)):
+            # 如果当前或前一个已被标记，则跳过，避免重复判断
+            if is_wash_trade.iloc[i] or is_wash_trade.iloc[i-1]:
+                continue
+
+            current_tick = df.iloc[i]
+            previous_tick = df.iloc[i-1]
+
+            # 条件1: 必须是连续的Tick (时间差约3秒)
+            if (current_tick['时间'] - previous_tick['时间']) > pd.Timedelta(seconds=5):
+                continue
+
+            # 条件2: 两笔都是成交量脉冲
+            is_current_spike = current_tick['成交量'] > volume_spike_threshold.iloc[i]
+            is_previous_spike = previous_tick['成交量'] > volume_spike_threshold.iloc[i-1]
+            if not (is_current_spike and is_previous_spike):
+                continue
+
+            # 条件3: 成交量相近 (例如，在15%的容忍度内)
+            volume_diff_ratio = abs(current_tick['成交量'] - previous_tick['成交量']) / max(current_tick['成交量'], previous_tick['成交量'])
+            if volume_diff_ratio > 0.15:
+                continue
+
+            # 条件4: 买卖性质相反
+            if current_tick['买卖盘性质'] == previous_tick['买卖盘性质']:
+                continue
+            
+            # 条件5: 价格变动几乎完全抵消
+            net_price_change = current_tick['价格变动'] + previous_tick['价格变动']
+            if abs(net_price_change) > 0.01: # 允许微小误差
+                continue
+            
+            # 如果所有条件都满足，则标记为对倒
+            is_wash_trade.iloc[i] = True
+            is_wash_trade.iloc[i-1] = True
+
+        wash_trade_volume = df.loc[is_wash_trade, '成交量'].sum()
+        clean_df = df.loc[~is_wash_trade]
+        
+        wash_trade_ratio = wash_trade_volume / total_volume
+        if wash_trade_ratio > 0.01:
+            print(f"    - {symbol} ({name}): 识别到对倒嫌疑，成交量占比: {wash_trade_ratio:.2%}")
+        else:
+            print(f"    - {symbol} ({name}): 未识别到明显对倒嫌疑")
+
+        return clean_df, wash_trade_ratio
 
     def analyze_trade_direction(self, tick_df):
         if tick_df is None or tick_df.empty: return {}
@@ -254,53 +366,71 @@ class QuantAnalysis:
             'active_buy_ratio': buy_volume / total_volume if total_volume > 0 else 0.5,
         }
 
-    def _calculate_score_v5(self, fund_flow_z_score, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio):
-        """(主模型) 计算股票上涨概率得分 (V5)"""
+    def _calculate_score_v7_4(self, fund_flow_z_score, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio, wash_trade_ratio):
+        """(主模型) 计算股票上涨概率得分 (V7.4 - 优化对倒惩罚)"""
         fund_flow_score = np.clip(fund_flow_z_score * 25, -50, 50)
         net_buy_score = np.clip(net_buy_adv_ratio / 0.1 * 20, -20, 20)
         impact_score = 15 - (impact_atr_ratio / 0.1) * 30
         impact_score = np.clip(impact_score, -15, 15)
+        
         momentum_score = 0
         if afternoon_momentum_ratio > 0.6:
             momentum_score = 10 * min((afternoon_momentum_ratio - 0.6) / 0.4, 1.0)
         elif afternoon_momentum_ratio < 0:
             momentum_score = -10
+            
         alpha_score = np.clip(excess_return / 2 * 5, -5, 5)
-        total_score = fund_flow_score + net_buy_score + impact_score + momentum_score + alpha_score
+        
+        # 对倒交易惩罚项: 对倒比例越高，惩罚越重
+        wash_trade_penalty = np.clip(wash_trade_ratio * 50, 0, 15)
+        
+        total_score = fund_flow_score + net_buy_score + impact_score + momentum_score + alpha_score - wash_trade_penalty
         return np.clip(total_score, -100, 100)
 
-    def _calculate_score_v4_fallback(self, active_buy_ratio, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio):
-        """(备用模型) 计算股票上涨概率得分 (V4)"""
+    def _calculate_score_v4_fallback(self, active_buy_ratio, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio, wash_trade_ratio):
+        """(备用模型) 计算股票上涨概率得分 (V4 - 增加对倒惩罚)"""
         buy_sell_score = (active_buy_ratio - 0.5) * 2 * 60
         net_buy_score = np.clip(net_buy_adv_ratio / 0.1 * 20, -20, 20)
         impact_score = 20 - (impact_atr_ratio / 0.1) * 40
         impact_score = np.clip(impact_score, -20, 20)
+        
         momentum_score = 0
         if afternoon_momentum_ratio > 0.6:
             momentum_score = 10 * min((afternoon_momentum_ratio - 0.6) / 0.4, 1.0)
         elif afternoon_momentum_ratio < 0:
             momentum_score = -10
+            
         alpha_score = np.clip(excess_return / 2 * 10, -10, 10)
-        total_score = buy_sell_score + net_buy_score + impact_score + momentum_score + alpha_score
+        
+        # 对倒交易惩罚项
+        wash_trade_penalty = np.clip(wash_trade_ratio * 50, 0, 15)
+        
+        total_score = buy_sell_score + net_buy_score + impact_score + momentum_score + alpha_score - wash_trade_penalty
         return np.clip(total_score, -100, 100)
 
     def analyze_stock_worker(self, stock, tick_df, market_performance, hist_metrics, fund_flow_data, volume_ratio, current_price, change_pct):
         symbol = stock['代码']
         name = stock['股票名称']
         
-        first_price = float(tick_df['成交价'].iloc[0])
-        last_price = float(tick_df['成交价'].iloc[-1])
+        # 步骤1: 清洗Tick数据，识别对倒交易
+        clean_tick_df, wash_trade_ratio = self._filter_wash_trades(tick_df, symbol, name)
+        
+        if clean_tick_df.empty:
+            return None # 如果所有数据都是对倒，则跳过分析
+
+        first_price = float(clean_tick_df['成交价'].iloc[0])
+        last_price = float(clean_tick_df['成交价'].iloc[-1])
         intraday_change = ((last_price - first_price) / first_price) * 100 if first_price > 0 else 0
         excess_return = intraday_change - market_performance
         
-        trade_direction = self.analyze_trade_direction(tick_df)
+        trade_direction = self.analyze_trade_direction(clean_tick_df)
         net_buy_volume = trade_direction.get('net_buy_volume', 0)
         
-        afternoon_ticks = tick_df[tick_df['时间'].dt.time >= pd.to_datetime('13:00:00').time()]
+        afternoon_ticks = clean_tick_df[clean_tick_df['时间'].dt.time >= pd.to_datetime('13:00:00').time()]
         afternoon_net_buy_volume = self.analyze_trade_direction(afternoon_ticks).get('net_buy_volume', 0)
         afternoon_momentum_ratio = afternoon_net_buy_volume / net_buy_volume if net_buy_volume > 0 else 0
 
-        avg_abs_impact = tick_df['price_impact'].abs().mean()
+        avg_abs_impact = clean_tick_df['price_impact'].abs().mean()
         
         adv20 = hist_metrics.get('adv20', 0)
         atr20 = hist_metrics.get('atr20', 0)
@@ -312,15 +442,15 @@ class QuantAnalysis:
         fund_flow_z_score = 0
         
         if fund_flow_data:
-            model_version = "V5"
+            model_version = "V7.4"
             mean = fund_flow_data.get('mean', 0)
             std = fund_flow_data.get('std', 1)
             today_flow = fund_flow_data.get('today', 0)
             fund_flow_z_score = (today_flow - mean) / std
-            score = self._calculate_score_v5(fund_flow_z_score, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio)
+            score = self._calculate_score_v7_4(fund_flow_z_score, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio, wash_trade_ratio)
         else:
             active_buy_ratio = trade_direction.get('active_buy_ratio', 0.5)
-            score = self._calculate_score_v4_fallback(active_buy_ratio, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio)
+            score = self._calculate_score_v4_fallback(active_buy_ratio, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio, wash_trade_ratio)
 
         return (symbol, {
             'name': name, 'score': score, 'model_version': model_version,
@@ -330,7 +460,8 @@ class QuantAnalysis:
             'net_buy_adv_ratio': net_buy_adv_ratio, 'impact_atr_ratio': impact_atr_ratio,
             'intraday_change': intraday_change, 'excess_return': excess_return,
             'active_buy_ratio': trade_direction.get('active_buy_ratio', 0.5),
-            'volume_ratio': volume_ratio
+            'volume_ratio': volume_ratio,
+            'wash_trade_ratio': wash_trade_ratio
         })
 
     def _get_realtime_quotes_worker(self):
@@ -347,7 +478,7 @@ class QuantAnalysis:
             return {}, {}, {}
 
     def analyze_stocks(self):
-        """分析所有热门股票 (V7.2流程)"""
+        """分析所有热门股票 (V7.4流程)"""
         market_performance = self._get_market_performance()
         all_stocks = self.get_hot_stocks()
         if not all_stocks: return []
@@ -395,8 +526,9 @@ class QuantAnalysis:
             futures = [executor.submit(self.analyze_stock_worker, s, df, market_performance, hm, ffd, vr, cp, chg) for s, df, hm, ffd, vr, cp, chg in valid_stocks]
             for f in as_completed(futures):
                 try:
-                    symbol, result = f.result()
-                    if result:
+                    res = f.result()
+                    if res:
+                        symbol, result = res
                         analysis_results[symbol] = result
                 except Exception as e:
                     print(f"  ⚠️ 分析任务异常: {e}")
@@ -410,14 +542,14 @@ class QuantAnalysis:
         return final_stocks
 
     def send_dingtalk_message(self, top_stocks):
-        """发送钉钉消息 (V7.2格式)"""
+        """发送钉钉消息 (V7.4格式)"""
         webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=ae055118615b242c6fe43fc3273a228f316209f707d07e7ce39fc83f4270ed82"
         secret = "SECf2b2861525388e240846ad1e2beb3b93d3b5f0d2e6634e43176b593f050e77da"
         
         stocks_to_send = top_stocks[:50]
         if not stocks_to_send: return False
         
-        text = f"# 📈 量化分析报告 V7.2 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        text = f"# 📈 量化分析报告 V7.4 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         text += f"## 🏆 股票评分排序 (Top {len(stocks_to_send)})\n\n"
         
         for i, (symbol, data) in enumerate(stocks_to_send, 1):
@@ -430,18 +562,19 @@ class QuantAnalysis:
 
             score_line = f"- **得分**: **{data['score']:.2f}** {model_tag}\n"
             
-            if data['model_version'] == 'V5':
+            if data['model_version'] == 'V7.4':
                 z_score_line = f"- **资金流强度 (Z-score)**: **{data['fund_flow_z_score']:.2f}**\n"
             else:
                 z_score_line = f"- **主动买入强度**: {data['active_buy_ratio']:.1%}\n"
 
             text += f"""{title_line}{score_line}- **量比**: {data.get('volume_ratio', 'N/A'):.2f}
+- **对倒嫌疑**: {data.get('wash_trade_ratio', 0):.2%}
 - **日内涨跌**: {data['intraday_change']:.2f}% (超额: {data['excess_return']:.2f}%)
 - **净买入占比 (vs ADV20)**: {data['net_buy_adv_ratio']:.2%}
 - **价格冲击 (vs ATR20)**: {data['impact_atr_ratio']:.2%}
 """
         
-        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V7.2", "text": text}}
+        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V7.4", "text": text}}
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
@@ -462,7 +595,7 @@ class QuantAnalysis:
 
     def run_analysis(self):
         """运行完整分析流程"""
-        print("🔍 量化分析系统 V7.2 - 开始分析热门股票")
+        print("🔍 量化分析系统 V7.4 - 开始分析热门股票")
         top_stocks = self.analyze_stocks()
         
         if not top_stocks:
@@ -494,6 +627,13 @@ class QuantAnalysis:
         tick_data, source = self.get_tick_data(symbol)
         if tick_data is not None and not tick_data.empty:
             print(f"    ✅ 成功 (来源: {source}), 获取到 {len(tick_data)} 条记录")
+            
+            print("\n  - 步骤4: 过滤对倒交易...")
+            # For testing, we need a dummy name. In real run, it's passed from stock object.
+            clean_df, wash_ratio = self._filter_wash_trades(tick_data, symbol, "测试股票")
+            print(f"    - 原始Tick数: {len(tick_data)}, 清洗后Tick数: {len(clean_df)}")
+            print(f"    - 对倒嫌疑成交量占比: {wash_ratio:.2%}")
+
         else:
             print(f"    ❌ 失败 (尝试了 {source})")
         
