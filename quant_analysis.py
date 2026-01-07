@@ -6,11 +6,6 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import time
 import traceback
-import matplotlib
-
-matplotlib.use('Agg')  # 使用非交互式后端
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 from collections import defaultdict
 
@@ -32,10 +27,7 @@ import json
 import hashlib
 import base64
 import hmac
-import sys
-from scipy import stats
 from sklearn.linear_model import LinearRegression
-import ta  # 使用 ta 库替代 talib
 
 
 class QuantAnalysis:
@@ -516,116 +508,10 @@ class QuantAnalysis:
             self._log_performance("get_hot_stocks", task_start)
             return []
 
-    def _process_tick_data(self, tick_df):
-        """处理Tick数据并计算指标"""
-        if tick_df is None or tick_df.empty:
-            return None, {}
 
-        # 创建副本避免修改原始数据
-        df = tick_df.copy()
 
-        # 中文列名映射到英文
-        column_mapping = {
-            '时间': 'time',
-            '成交价': 'price',
-            '成交量': 'volume',
-            '买卖盘性质': 'trade_type',
-            '价格变动': 'price_change'
-        }
 
-        # 重命名列
-        rename_dict = {k: v for k, v in column_mapping.items() if k in df.columns}
-        if rename_dict:
-            df = df.rename(columns=rename_dict)
 
-        # 将中文值映射为英文
-        if 'trade_type' in df.columns:
-            trade_type_mapping = {
-                '买盘': 'buy',
-                '卖盘': 'sell',
-                '中性盘': 'neutral'
-            }
-            df['trade_type'] = df['trade_type'].map(lambda x: trade_type_mapping.get(x, x))
-
-        # 确保时间列是datetime类型
-        if 'time' in df.columns:
-            df['time'] = pd.to_datetime(df['time'])
-
-        # 计算各种指标
-        if 'price_change' in df.columns and 'volume' in df.columns:
-            df['price_impact'] = df['price_change'] / df['volume']
-            df['price_impact'].fillna(0, inplace=True)
-
-        if 'time' in df.columns:
-            df['time_diff'] = df['time'].diff().dt.total_seconds()
-            df['time_diff'] = df['time_diff'].fillna(0)
-
-        if 'volume' in df.columns and 'time_diff' in df.columns:
-            df['volume_rate'] = df['volume'] / (df['time_diff'] + 0.001)
-
-        if 'volume' in df.columns:
-            df['cum_volume'] = df['volume'].cumsum()
-
-        if 'price_change' in df.columns:
-            df['cum_price_change'] = df['price_change'].cumsum()
-
-        if 'price' in df.columns and 'volume' in df.columns:
-            df['volume_price'] = df['price'] * df['volume']
-            df['cum_volume_price'] = df['volume_price'].cumsum()
-            df['vwap'] = df['cum_volume_price'] / df['cum_volume']
-
-        if 'price' in df.columns:
-            df['ma10'] = df['price'].rolling(window=10).mean()
-
-        # 计算指标
-        metrics = self._calculate_metrics(df)
-
-        return df, metrics
-
-    def _calculate_metrics(self, df):
-        """计算各种指标"""
-        metrics = {}
-
-        # 买卖比例
-        if 'trade_type' in df.columns and 'volume' in df.columns:
-            buy_volume = df[df['trade_type'] == 'buy']['volume'].sum()
-            sell_volume = df[df['trade_type'] == 'sell']['volume'].sum()
-            total_volume = buy_volume + sell_volume
-
-            if total_volume > 0:
-                metrics['buy_sell_ratio'] = (buy_volume / total_volume) * 100
-            else:
-                metrics['buy_sell_ratio'] = 50.0
-
-        # 平均成交量
-        if 'volume' in df.columns:
-            metrics['avg_volume'] = df['volume'].mean()
-
-        # 大单和小单比例
-        if 'volume' in df.columns:
-            volume_threshold = df['volume'].quantile(0.75)
-            large_orders = df[df['volume'] >= volume_threshold]
-            small_orders = df[df['volume'] < volume_threshold]
-
-            total_volume = df['volume'].sum()
-            if total_volume > 0:
-                metrics['large_order_ratio'] = (large_orders['volume'].sum() / total_volume) * 100
-                metrics['small_order_ratio'] = (small_orders['volume'].sum() / total_volume) * 100
-            else:
-                metrics['large_order_ratio'] = 0
-                metrics['small_order_ratio'] = 0
-
-        # 价格波动率
-        if 'price' in df.columns:
-            metrics['price_volatility'] = df['price'].std() / df['price'].mean() * 100 if df['price'].mean() > 0 else 0
-
-        # 价格趋势
-        if 'price' in df.columns and len(df) > 1:
-            first_price = df['price'].iloc[0]
-            last_price = df['price'].iloc[-1]
-            metrics['trend'] = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
-
-        return metrics
 
     def get_tick_data(self, symbol, thread_id=""):
         """获取股票的Tick数据，始终从API获取最新数据"""
@@ -1548,16 +1434,7 @@ class QuantAnalysis:
 
 def main():
     analyzer = QuantAnalysis()
-
-    # 解析命令行参数
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "test" and len(sys.argv) > 2:
-            analyzer.test_single_stock(sys.argv[2])
-        else:
-            print(f"未知命令: {sys.argv[1]}")
-            print("用法: python script.py [test SYMBOL]")
-    else:
-        analyzer.run_analysis()
+    analyzer.run_analysis()
 
 
 if __name__ == "__main__":
