@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-量化分析系统：热门股票分析 (模型 V7.4 - 优化对倒交易识别)
-"""
 
 import os
 import warnings
@@ -11,7 +8,6 @@ import time
 import itertools
 import sys
 
-# 在导入其他库之前抑制所有警告
 warnings.filterwarnings('ignore')
 import akshare as ak
 try:
@@ -37,7 +33,6 @@ class QuantAnalysis:
         self.fund_flow_cache_file = "fund_flow_cache.json"
 
     def _get_market_performance(self):
-        """获取大盘表现作为基准"""
         try:
             market_df = ak.stock_individual_spot_xq(symbol="SH000001")
             change_row = market_df[market_df['item'] == '涨幅']
@@ -50,7 +45,6 @@ class QuantAnalysis:
         return 0.0
 
     def _get_historical_data(self, symbol, thread_id=""):
-        """获取单个股票的历史数据用于计算ADV和ATR"""
         try:
             end_date = datetime.now().strftime('%Y%m%d')
             start_date = (datetime.now() - timedelta(days=40)).strftime('%Y%m%d')
@@ -68,7 +62,6 @@ class QuantAnalysis:
             return None
 
     def _get_fund_flow_with_history(self, symbol, thread_id=""):
-        """获取单个股票的资金流数据（包括当天和历史）"""
         try:
             pure_code = symbol[2:]
             market = "sh" if symbol.startswith("SH") else "sz"
@@ -99,7 +92,6 @@ class QuantAnalysis:
             return None
 
     def _incremental_cache_batch_processor(self, symbols, cache_path, processor_func, entity_name):
-        """通用增量更新缓存处理器"""
         today_str = datetime.now().strftime('%Y-%m-%d')
         cached_data = {}
         cache_filename = os.path.basename(cache_path)
@@ -149,7 +141,6 @@ class QuantAnalysis:
         return cached_data
 
     def get_hot_stocks(self):
-        """获取当日最热的沪深主板非ST A股股票，带每日缓存"""
         today_str = datetime.now().strftime('%Y-%m-%d')
         cache_path = self.hot_stocks_cache_file
         cache_filename = os.path.basename(cache_path)
@@ -160,7 +151,7 @@ class QuantAnalysis:
                     cache_data = json.load(f)
                     if cache_data.get('date') == today_str:
                         stocks = cache_data.get('stocks', [])
-                        if stocks:  # 检查缓存是否为空
+                        if stocks:
                             print(f"✅ 从缓存文件 '{cache_filename}' 加载热门股票列表，共 {len(stocks)} 条记录")
                             return stocks
                         else:
@@ -171,7 +162,6 @@ class QuantAnalysis:
         print("🔄 从API获取热门股票排行榜...")
         hot_stock_codes = set()
 
-        # Source 1: East Money
         try:
             hot_rank_df = ak.stock_hot_rank_em()
             if hot_rank_df is not None and not hot_rank_df.empty:
@@ -180,12 +170,10 @@ class QuantAnalysis:
         except Exception as e:
             print(f"⚠️ 获取东方财富热门股失败: {e}")
 
-        # Source 2: Baidu Search
         try:
             baidu_date = datetime.now().strftime('%Y%m%d')
             baidu_hot_df = ak.stock_hot_search_baidu(symbol="A股", date=baidu_date, time="今日")
             if baidu_hot_df is not None and not baidu_hot_df.empty:
-                # The column is '股票代码'
                 baidu_codes = baidu_hot_df['股票代码'].tolist()
                 initial_count = len(hot_stock_codes)
                 hot_stock_codes.update(baidu_codes)
@@ -203,7 +191,6 @@ class QuantAnalysis:
             spot_df = ak.stock_zh_a_spot_em()
             spot_df['代码'] = spot_df['代码'].apply(lambda x: f"SH{x}" if x.startswith('6') else f"SZ{x}")
 
-            # Filter the spot dataframe to only include our hot stocks
             filtered_df = spot_df[spot_df['代码'].isin(hot_stock_codes)].copy()
 
             is_main = filtered_df['代码'].str.startswith(('SZ00', 'SH60'))
@@ -212,7 +199,6 @@ class QuantAnalysis:
 
             final_df = filtered_df[is_main & is_not_st & is_price_ok]
 
-            # The column name for stock name is '名称' in spot_df
             final_df = final_df.rename(columns={'名称': '股票名称'})
             final_stocks = final_df[['代码', '股票名称']].to_dict('records')
 
@@ -229,15 +215,14 @@ class QuantAnalysis:
             return []
 
     def get_tick_data(self, symbol, thread_id=""):
-        """获取并处理股票的tick数据，增加备用数据源"""
         tick_df, source = None, "未知"
-        try: # 1. Primary: Tencent
+        try:
             tick_df = ak.stock_zh_a_tick_tx_js(symbol=symbol.lower())
             if tick_df is None or tick_df.empty: raise ValueError("Tencent data is empty")
             source = "腾讯"
             tick_df = tick_df.rename(columns={'成交时间': '时间', '成交价格': '成交价', '性质': '买卖盘性质', '价格变动': '价格变动'})
         except Exception:
-            try: # 2. Fallback: East Money
+            try:
                 tick_df = ak.stock_intraday_em(symbol=symbol[2:])
                 if tick_df is None or tick_df.empty: raise ValueError("East Money data is empty")
                 source = "东方财富"
@@ -280,13 +265,7 @@ class QuantAnalysis:
         return results
 
     def _filter_wash_trades(self, tick_df, symbol, name):
-        """
-        识别并过滤3秒快照数据中的疑似对倒交易。
-        该方法检查两种模式：
-        1. 单笔Tick内的量价背离 (Intra-Tick Divergence): 巨大的成交量但价格无变化。
-        2. 连续Tick间的脉冲抵消 (Inter-Tick Cancellation): 连续两笔巨量Tick，性质相反，且价格变动相互抵消。
-        """
-        if tick_df is None or len(tick_df) < 20: # 需要足够数据来计算基准
+        if tick_df is None or len(tick_df) < 20:
             return tick_df, 0
 
         df = tick_df.copy()
@@ -294,7 +273,6 @@ class QuantAnalysis:
         if total_volume == 0:
             return df, 0
 
-        # --- 定义基准 ---
         rolling_window = 20
         volume_mean = df['成交量'].rolling(window=rolling_window, min_periods=5).mean().fillna(df['成交量'].mean())
         volume_std = df['成交量'].rolling(window=rolling_window, min_periods=5).std().fillna(df['成交量'].std())
@@ -302,46 +280,37 @@ class QuantAnalysis:
         
         is_wash_trade = pd.Series(False, index=df.index)
 
-        # --- 特征一：单笔Tick内的量价背离 ---
-        is_spike = df['成交量'] > volume_spike_threshold * 2 # 对单笔要求更高
+        is_spike = df['成交量'] > volume_spike_threshold * 2
         is_no_price_change = df['价格变动'] == 0
         feature1_mask = is_spike & is_no_price_change
         is_wash_trade[feature1_mask] = True
 
-        # --- 特征二：连续Tick间的脉冲抵消 ---
         for i in range(1, len(df)):
-            # 如果当前或前一个已被标记，则跳过，避免重复判断
             if is_wash_trade.iloc[i] or is_wash_trade.iloc[i-1]:
                 continue
 
             current_tick = df.iloc[i]
             previous_tick = df.iloc[i-1]
 
-            # 条件1: 必须是连续的Tick (时间差约3秒)
             if (current_tick['时间'] - previous_tick['时间']) > pd.Timedelta(seconds=5):
                 continue
 
-            # 条件2: 两笔都是成交量脉冲
             is_current_spike = current_tick['成交量'] > volume_spike_threshold.iloc[i]
             is_previous_spike = previous_tick['成交量'] > volume_spike_threshold.iloc[i-1]
             if not (is_current_spike and is_previous_spike):
                 continue
 
-            # 条件3: 成交量相近 (例如，在15%的容忍度内)
             volume_diff_ratio = abs(current_tick['成交量'] - previous_tick['成交量']) / max(current_tick['成交量'], previous_tick['成交量'])
             if volume_diff_ratio > 0.15:
                 continue
 
-            # 条件4: 买卖性质相反
             if current_tick['买卖盘性质'] == previous_tick['买卖盘性质']:
                 continue
             
-            # 条件5: 价格变动几乎完全抵消
             net_price_change = current_tick['价格变动'] + previous_tick['价格变动']
-            if abs(net_price_change) > 0.01: # 允许微小误差
+            if abs(net_price_change) > 0.01:
                 continue
             
-            # 如果所有条件都满足，则标记为对倒
             is_wash_trade.iloc[i] = True
             is_wash_trade.iloc[i-1] = True
 
@@ -367,7 +336,6 @@ class QuantAnalysis:
         }
 
     def _calculate_score_v7_4(self, fund_flow_z_score, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio, wash_trade_ratio):
-        """(主模型) 计算股票上涨概率得分 (V7.4 - 优化对倒惩罚)"""
         fund_flow_score = np.clip(fund_flow_z_score * 25, -50, 50)
         net_buy_score = np.clip(net_buy_adv_ratio / 0.1 * 20, -20, 20)
         impact_score = 15 - (impact_atr_ratio / 0.1) * 30
@@ -381,14 +349,12 @@ class QuantAnalysis:
             
         alpha_score = np.clip(excess_return / 2 * 5, -5, 5)
         
-        # 对倒交易惩罚项: 对倒比例越高，惩罚越重
         wash_trade_penalty = np.clip(wash_trade_ratio * 50, 0, 15)
         
         total_score = fund_flow_score + net_buy_score + impact_score + momentum_score + alpha_score - wash_trade_penalty
         return np.clip(total_score, -100, 100)
 
     def _calculate_score_v4_fallback(self, active_buy_ratio, net_buy_adv_ratio, impact_atr_ratio, excess_return, afternoon_momentum_ratio, wash_trade_ratio):
-        """(备用模型) 计算股票上涨概率得分 (V4 - 增加对倒惩罚)"""
         buy_sell_score = (active_buy_ratio - 0.5) * 2 * 60
         net_buy_score = np.clip(net_buy_adv_ratio / 0.1 * 20, -20, 20)
         impact_score = 20 - (impact_atr_ratio / 0.1) * 40
@@ -402,7 +368,6 @@ class QuantAnalysis:
             
         alpha_score = np.clip(excess_return / 2 * 10, -10, 10)
         
-        # 对倒交易惩罚项
         wash_trade_penalty = np.clip(wash_trade_ratio * 50, 0, 15)
         
         total_score = buy_sell_score + net_buy_score + impact_score + momentum_score + alpha_score - wash_trade_penalty
@@ -412,11 +377,10 @@ class QuantAnalysis:
         symbol = stock['代码']
         name = stock['股票名称']
         
-        # 步骤1: 清洗Tick数据，识别对倒交易
         clean_tick_df, wash_trade_ratio = self._filter_wash_trades(tick_df, symbol, name)
         
         if clean_tick_df.empty:
-            return None # 如果所有数据都是对倒，则跳过分析
+            return None
 
         first_price = float(clean_tick_df['成交价'].iloc[0])
         last_price = float(clean_tick_df['成交价'].iloc[-1])
@@ -465,7 +429,6 @@ class QuantAnalysis:
         })
 
     def _get_realtime_quotes_worker(self):
-        """获取全市场实时行情的工作函数"""
         try:
             spot_df = ak.stock_zh_a_spot_em()
             spot_df['代码'] = spot_df['代码'].apply(lambda x: f"SH{x}" if x.startswith('6') else f"SZ{x}")
@@ -478,7 +441,6 @@ class QuantAnalysis:
             return {}, {}, {}
 
     def analyze_stocks(self):
-        """分析所有热门股票 (V7.4流程)"""
         market_performance = self._get_market_performance()
         all_stocks = self.get_hot_stocks()
         if not all_stocks: return []
@@ -542,7 +504,6 @@ class QuantAnalysis:
         return final_stocks
 
     def send_dingtalk_message(self, top_stocks):
-        """发送钉钉消息 (V7.4格式)"""
         webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=ae055118615b242c6fe43fc3273a228f316209f707d07e7ce39fc83f4270ed82"
         secret = "SECf2b2861525388e240846ad1e2beb3b93d3b5f0d2e6634e43176b593f050e77da"
         
@@ -594,7 +555,6 @@ class QuantAnalysis:
             return False
 
     def run_analysis(self):
-        """运行完整分析流程"""
         print("🔍 量化分析系统 V7.4 - 开始分析热门股票")
         top_stocks = self.analyze_stocks()
         
@@ -605,7 +565,6 @@ class QuantAnalysis:
         self.send_dingtalk_message(top_stocks)
 
     def test_single_stock(self, symbol):
-        """诊断单只股票的数据获取流程"""
         print(f"\n🔬 开始诊断单只股票: {symbol}\n")
         
         print("  - 步骤1: 获取历史行情 (ADV/ATR)...")
@@ -629,7 +588,6 @@ class QuantAnalysis:
             print(f"    ✅ 成功 (来源: {source}), 获取到 {len(tick_data)} 条记录")
             
             print("\n  - 步骤4: 过滤对倒交易...")
-            # For testing, we need a dummy name. In real run, it's passed from stock object.
             clean_df, wash_ratio = self._filter_wash_trades(tick_data, symbol, "测试股票")
             print(f"    - 原始Tick数: {len(tick_data)}, 清洗后Tick数: {len(clean_df)}")
             print(f"    - 对倒嫌疑成交量占比: {wash_ratio:.2%}")
@@ -643,11 +601,5 @@ def main():
     analyzer = QuantAnalysis()
     analyzer.run_analysis()
     
-    # --- 单股诊断工具 ---
-    # 1. 注释掉上面的 analyzer.run_analysis()
-    # 2. 取消下面的注释
-    # 3. 填入你想测试的股票代码
-    # analyzer.test_single_stock("SZ002413")
-
 if __name__ == "__main__":
     main()
