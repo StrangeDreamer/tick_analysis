@@ -554,7 +554,19 @@ class QuantAnalysis:
         if tick_df.empty:
             self._log_performance("get_tick_data", task_start)
             return None, source
-
+        # 打印最新的5条tick数据
+        try:
+            print(f"\n📊 {symbol} 最新 5 条 tick 数据 (来源: {source}):")
+            latest_ticks = tick_df.sort_values('时间', ascending=False).head(5)
+            for _, row in latest_ticks.iterrows():
+                time_str = row['时间'].strftime('%H:%M:%S')
+                price = row['成交价']
+                volume = row['成交量']
+                trade_type = row['买卖盘性质']
+                price_change = row['价格变动']
+                print(f"  {time_str} | 价格: {price:.2f} | 变动: {price_change:.3f} | 成交量: {volume} | {trade_type}")
+        except Exception as e:
+            print(f"  ⚠️ 打印tick数据时出错: {e}")
         # 计算价格冲击
         tick_df.loc[:, 'price_impact'] = tick_df['价格变动'] / tick_df['成交量']
         tick_df['price_impact'].fillna(0, inplace=True)
