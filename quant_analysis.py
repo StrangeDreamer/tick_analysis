@@ -432,39 +432,6 @@ class QuantAnalysis:
         except Exception as e:
             print(f"⚠️ 获取东方财富热门股失败: {e}")
 
-        # 获取百度热搜股票
-        try:
-            baidu_date = datetime.now().strftime('%Y%m%d')
-            baidu_hot_df = ak.stock_hot_search_baidu(symbol="A股", date=baidu_date, time="今日")
-            if baidu_hot_df is not None and not baidu_hot_df.empty:
-                baidu_codes = baidu_hot_df['股票代码'].tolist()
-                initial_count = len(hot_stock_codes)
-                hot_stock_codes.update(baidu_codes)
-                print(f"✅ 从百度热搜新增 {len(hot_stock_codes) - initial_count} 只热门股")
-        except Exception as e:
-            print(f"⚠️ 获取百度热搜股票失败: {e}")
-
-        # 获取雪球热门股票
-        try:
-            xq_hot_df = ak.stock_hot_rank_detail_xq(symbol="最热门")
-            if xq_hot_df is not None and not xq_hot_df.empty:
-                xq_codes = xq_hot_df['股票代码'].tolist()
-                initial_count = len(hot_stock_codes)
-                hot_stock_codes.update(xq_codes)
-                print(f"✅ 从雪球热门新增 {len(hot_stock_codes) - initial_count} 只热门股")
-        except Exception as e:
-            print(f"⚠️ 获取雪球热门股票失败: {e}")
-
-        # 获取龙虎榜股票
-        try:
-            lhb_df = ak.stock_lhb_em()
-            if lhb_df is not None and not lhb_df.empty:
-                lhb_codes = lhb_df['代码'].tolist()
-                initial_count = len(hot_stock_codes)
-                hot_stock_codes.update(lhb_codes)
-                print(f"✅ 从龙虎榜新增 {len(hot_stock_codes) - initial_count} 只热门股")
-        except Exception as e:
-            print(f"⚠️ 获取龙虎榜股票失败: {e}")
 
         if not hot_stock_codes:
             print("❌ 未从任何来源获取到热门股")
