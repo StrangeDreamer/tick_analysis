@@ -27,7 +27,6 @@ import json
 import hashlib
 import base64
 import hmac
-from sklearn.linear_model import LinearRegression
 
 
 class QuantAnalysis:
