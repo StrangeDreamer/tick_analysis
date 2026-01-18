@@ -9,8 +9,8 @@ import sys
 import argparse
 import time
 import os
-import importlib.util
 from datetime import datetime, time as dt_time
+from quant_analysis import QuantAnalysis
 
 def is_trading_time():
     """判断当前是否在开市时间内"""
@@ -38,18 +38,7 @@ def is_trading_time():
 def run_analysis():
     """执行量化分析 - 直接导入模块调用"""
     try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        module_path = os.path.join(script_dir, "quant_analysis.py")
-        
-        spec = importlib.util.spec_from_file_location("quant_analysis_copy", module_path)
-        if spec is None or spec.loader is None:
-            print(f"❌ 无法加载模块: {module_path}")
-            return False
-        
-        quant_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(quant_module)
-        
-        analyzer = quant_module.QuantAnalysis()
+        analyzer = QuantAnalysis()
         
         # 执行分析，不再需要任何参数
         analyzer.run_analysis()
