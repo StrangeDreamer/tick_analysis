@@ -30,13 +30,12 @@ import hmac
 
 
 class QuantAnalysis:
-    def __init__(self):
+    def __init__(self, force_refresh=False):
         self.max_workers = min(os.cpu_count() + 4, 16)  # 优化线程数
         self.hot_stocks_cache_file = "hot_stocks_cache.json"
-        self.historical_metrics_cache_file = "historical_metrics_cache.json"
-        self.fund_flow_cache_file = "fund_flow_cache.json"
         self.tick_cache_dir = "tick_cache"
         self.chart_dir = "charts"
+        self.force_refresh = force_refresh  # 是否强制刷新缓存
 
         # 确保缓存目录存在
         for directory in [self.tick_cache_dir, self.chart_dir]:
@@ -56,7 +55,8 @@ class QuantAnalysis:
         # 初始化市场状态
         self.market_status = self._get_market_status()
 
-        print(f"🚀 量化分析系统 V8.0 初始化完成，当前市场状态: {self.market_status}")
+        force_msg = "（强制刷新模式）" if force_refresh else ""
+        print(f"🚀 量化分析系统 V8.4-Intraday 初始化完成{force_msg}，当前市场状态: {self.market_status}")
 
     def _log_performance(self, task_name, start_time):
         """记录任务执行时间"""
@@ -89,259 +89,7 @@ class QuantAnalysis:
         else:
             return "午间休市"
 
-    def _get_market_performance(self):
-        """获取大盘表现作为基准"""
-        task_start = time.time()
-        try:
-            market_df = ak.stock_individual_spot_xq(symbol="SH000001")
-            change_row = market_df[market_df['item'] == '涨幅']
-            if not change_row.empty:
-                market_change_pct = change_row['value'].iloc[0]
-                print(f"📈 大盘基准 (上证指数): {market_change_pct:.2f}%")
 
-                # 获取上证50、沪深300和创业板指数表现
-                try:
-                    sz50_df = ak.stock_individual_spot_xq(symbol="SH000016")
-                    sz50_change = sz50_df[sz50_df['item'] == '涨幅']['value'].iloc[0]
-
-                    hs300_df = ak.stock_individual_spot_xq(symbol="SH000300")
-                    hs300_change = hs300_df[hs300_df['item'] == '涨幅']['value'].iloc[0]
-
-                    cyb_df = ak.stock_individual_spot_xq(symbol="SZ399006")
-                    cyb_change = cyb_df[cyb_df['item'] == '涨幅']['value'].iloc[0]
-
-                    print(
-                        f"📊 市场表现: 上证50 {sz50_change:.2f}% | 沪深300 {hs300_change:.2f}% | 创业板 {cyb_change:.2f}%")
-                except Exception:
-                    pass
-
-                self._log_performance("get_market_perf", task_start)
-                return float(market_change_pct)
-        except Exception as e:
-            print(f"⚠️ 无法获取大盘表现: {e}")
-        self._log_performance("get_market_perf", task_start)
-        return 0.0
-
-    def _get_historical_data(self, symbol, thread_id=""):
-        """获取历史数据，计算ADV20、ATR20等技术指标"""
-        try:
-            end_date = datetime.now().strftime('%Y%m%d')
-            start_date = (datetime.now() - timedelta(days=60)).strftime('%Y%m%d')  # 扩大历史数据范围
-            pure_code = symbol[2:]
-            hist_df = ak.stock_zh_a_hist(symbol=pure_code, start_date=start_date, end_date=end_date, adjust="qfq")
-            if hist_df is None or len(hist_df) < 21: return None
-
-            # 基础量价指标
-            adv20 = hist_df['成交量'].rolling(window=20).mean().iloc[-1]
-
-            # 计算ATR20
-            high_low = hist_df['最高'] - hist_df['最低']
-            high_prev_close = np.abs(hist_df['最高'] - hist_df['收盘'].shift())
-            low_prev_close = np.abs(hist_df['最低'] - hist_df['收盘'].shift())
-            tr = np.max(pd.DataFrame({'hl': high_low, 'hpc': high_prev_close, 'lpc': low_prev_close}), axis=1)
-            atr20 = tr.rolling(window=20).mean().iloc[-1]
-
-            # 计算波动率
-            returns = hist_df['收盘'].pct_change()
-            volatility = returns.rolling(window=20).std().iloc[-1] * np.sqrt(252)
-
-            # 计算趋势强度
-            sma5 = hist_df['收盘'].rolling(window=5).mean()
-            sma20 = hist_df['收盘'].rolling(window=20).mean()
-            trend_strength = (sma5.iloc[-1] / sma20.iloc[-1] - 1) * 100
-
-            # 计算RSI
-            delta = hist_df['收盘'].diff()
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-            avg_gain = gain.rolling(window=14).mean()
-            avg_loss = loss.rolling(window=14).mean()
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs)).iloc[-1]
-
-            # 计算MACD
-            exp12 = hist_df['收盘'].ewm(span=12, adjust=False).mean()
-            exp26 = hist_df['收盘'].ewm(span=26, adjust=False).mean()
-            macd = exp12 - exp26
-            signal = macd.ewm(span=9, adjust=False).mean()
-            macd_hist = macd - signal
-            macd_value = macd.iloc[-1]
-            macd_signal = signal.iloc[-1]
-            macd_hist_value = macd_hist.iloc[-1]
-
-            # 计算布林带
-            middle_band = hist_df['收盘'].rolling(window=20).mean()
-            std_dev = hist_df['收盘'].rolling(window=20).std()
-            upper_band = middle_band + (std_dev * 2)
-            lower_band = middle_band - (std_dev * 2)
-            bb_width = (upper_band - lower_band) / middle_band
-            bb_width_value = bb_width.iloc[-1]
-
-            # 计算相对强度(与大盘比较)
-            try:
-                market_df = ak.stock_zh_a_hist(symbol="000001", start_date=start_date, end_date=end_date, adjust="qfq",
-                                               period="daily")
-                if market_df is not None and len(market_df) >= len(hist_df):
-                    stock_returns = hist_df['收盘'].pct_change().dropna()
-                    market_returns = market_df['收盘'].pct_change().dropna()
-                    # 确保长度一致
-                    min_len = min(len(stock_returns), len(market_returns))
-                    stock_returns = stock_returns[-min_len:]
-                    market_returns = market_returns[-min_len:]
-
-                    # 计算Beta和Alpha
-                    if len(stock_returns) > 5:
-                        beta = np.cov(stock_returns, market_returns)[0, 1] / np.var(market_returns)
-                        alpha = (stock_returns.mean() - beta * market_returns.mean()) * 252  # 年化Alpha
-                    else:
-                        beta = 1.0
-                        alpha = 0.0
-                else:
-                    beta = 1.0
-                    alpha = 0.0
-            except Exception:
-                beta = 1.0
-                alpha = 0.0
-
-            # 计算成交量变化趋势
-            volume_trend = hist_df['成交量'].pct_change().rolling(window=5).mean().iloc[-1]
-
-            # 计算价格动量
-            momentum_5d = (hist_df['收盘'].iloc[-1] / hist_df['收盘'].iloc[-6] - 1) * 100 if len(hist_df) >= 6 else 0
-            momentum_10d = (hist_df['收盘'].iloc[-1] / hist_df['收盘'].iloc[-11] - 1) * 100 if len(hist_df) >= 11 else 0
-
-            # 计算换手率平均值
-            turnover_mean = hist_df['换手率'].rolling(window=20).mean().iloc[-1] if '换手率' in hist_df.columns else 0
-
-            # 计算价格与成交量相关性
-            if len(hist_df) >= 20:
-                price_changes = hist_df['收盘'].pct_change().iloc[-20:]
-                volume_changes = hist_df['成交量'].pct_change().iloc[-20:]
-                price_volume_corr = price_changes.corr(volume_changes)
-            else:
-                price_volume_corr = 0
-
-            return {
-                'adv20': adv20,
-                'atr20': atr20,
-                'volatility': volatility,
-                'trend_strength': trend_strength,
-                'rsi': rsi,
-                'macd': macd_value,
-                'macd_signal': macd_signal,
-                'macd_hist': macd_hist_value,
-                'bb_width': bb_width_value,
-                'beta': beta,
-                'alpha': alpha,
-                'volume_trend': volume_trend,
-                'momentum_5d': momentum_5d,
-                'momentum_10d': momentum_10d,
-                'turnover_mean': turnover_mean,
-                'price_volume_corr': price_volume_corr
-            }
-        except Exception as e:
-            print(f"  ⚠️ 获取历史数据异常 ({symbol}): {e}")
-            return None
-
-    def _get_fund_flow_with_history(self, symbol, thread_id=""):
-        """获取资金流数据，包括历史统计"""
-        try:
-            pure_code = symbol[2:]
-            market = "sh" if symbol.startswith("SH") else "sz"
-
-            flow_df = ak.stock_individual_fund_flow(stock=pure_code, market=market)
-
-            if flow_df is None or flow_df.empty or len(flow_df) < 21:
-                return None
-
-            flow_df['日期'] = pd.to_datetime(flow_df['日期'])
-            flow_df = flow_df.sort_values(by='日期').reset_index(drop=True)
-
-            # 检查必要的列是否存在
-            required_columns = ['主力净流入-净额', '超大单净流入-净额', '大单净流入-净额', '中单净流入-净额',
-                                '小单净流入-净额']
-            for col in required_columns:
-                if col not in flow_df.columns:
-                    print(f"  ⚠️ 资金流数据缺少列: {col}")
-                    return None
-
-            # 计算散户净流入-净额 (小单 + 中单)
-            flow_df['散户净流入-净额'] = flow_df['小单净流入-净额'] + flow_df['中单净流入-净额']
-
-            today_flow_row = flow_df.iloc[-1]
-            today_main_inflow = today_flow_row['主力净流入-净额'] / 10000
-            today_retail_inflow = today_flow_row['散户净流入-净额'] / 10000
-            today_super_inflow = today_flow_row['超大单净流入-净额'] / 10000
-            today_big_inflow = today_flow_row['大单净流入-净额'] / 10000
-            today_mid_inflow = today_flow_row['中单净流入-净额'] / 10000
-            today_small_inflow = today_flow_row['小单净流入-净额'] / 10000
-
-            historical_flows = flow_df.iloc[-21:-1]
-            if len(historical_flows) < 20: return None
-
-            # 计算主力资金流统计
-            main_inflow_mean = historical_flows['主力净流入-净额'].mean() / 10000
-            main_inflow_std = historical_flows['主力净流入-净额'].std() / 10000
-
-            # 计算超大单资金流统计
-            super_inflow_mean = historical_flows['超大单净流入-净额'].mean() / 10000
-            super_inflow_std = historical_flows['超大单净流入-净额'].std() / 10000
-
-            # 计算大单资金流统计
-            big_inflow_mean = historical_flows['大单净流入-净额'].mean() / 10000
-            big_inflow_std = historical_flows['大单净流入-净额'].std() / 10000
-
-            # 计算中单资金流统计
-            mid_inflow_mean = historical_flows['中单净流入-净额'].mean() / 10000
-            mid_inflow_std = historical_flows['中单净流入-净额'].std() / 10000
-
-            # 计算小单资金流统计
-            small_inflow_mean = historical_flows['小单净流入-净额'].mean() / 10000
-            small_inflow_std = historical_flows['小单净流入-净额'].std() / 10000
-
-            # 计算散户资金流统计
-            retail_inflow_mean = historical_flows['散户净流入-净额'].mean() / 10000
-            retail_inflow_std = historical_flows['散户净流入-净额'].std() / 10000
-
-            # 计算资金流趋势
-            if len(historical_flows) >= 5:
-                recent_flows = historical_flows['主力净流入-净额'].values[-5:] / 10000
-                flow_trend = np.polyfit(range(len(recent_flows)), recent_flows, 1)[0]
-            else:
-                flow_trend = 0
-
-            # 计算资金流连续性
-            if len(historical_flows) >= 3:
-                recent_signs = np.sign(historical_flows['主力净流入-净额'].values[-3:])
-                flow_consistency = 1 if np.all(recent_signs > 0) else (-1 if np.all(recent_signs < 0) else 0)
-            else:
-                flow_consistency = 0
-
-            return {
-                'today_main': today_main_inflow,
-                'today_retail': today_retail_inflow,
-                'today_super': today_super_inflow,
-                'today_big': today_big_inflow,
-                'today_mid': today_mid_inflow,
-                'today_small': today_small_inflow,
-                'main_mean': main_inflow_mean,
-                'main_std': main_inflow_std if np.isfinite(main_inflow_std) and main_inflow_std > 0 else 1.0,
-                'super_mean': super_inflow_mean,
-                'super_std': super_inflow_std if np.isfinite(super_inflow_std) and super_inflow_std > 0 else 1.0,
-                'big_mean': big_inflow_mean,
-                'big_std': big_inflow_std if np.isfinite(big_inflow_std) and big_inflow_std > 0 else 1.0,
-                'mid_mean': mid_inflow_mean,
-                'mid_std': mid_inflow_std if np.isfinite(mid_inflow_std) and mid_inflow_std > 0 else 1.0,
-                'small_mean': small_inflow_mean,
-                'small_std': small_inflow_std if np.isfinite(small_inflow_std) and small_inflow_std > 0 else 1.0,
-                'retail_mean': retail_inflow_mean,
-                'retail_std': retail_inflow_std if np.isfinite(retail_inflow_std) and retail_inflow_std > 0 else 1.0,
-                'flow_trend': flow_trend,
-                'flow_consistency': flow_consistency
-            }
-        except Exception as e:
-            print(f"  ⚠️ 获取资金流异常 ({symbol}): {e}")
-            return None
 
     def _incremental_cache_batch_processor(self, symbols, cache_path, processor_func, entity_name):
         """增量处理数据并缓存结果"""
@@ -370,6 +118,8 @@ class QuantAnalysis:
         print(f"🔄 需为 {len(missing_symbols)}/{len(symbols)} 只股票获取 {entity_name}...")
 
         newly_fetched_data = {}
+        failed_count = 0
+        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             f_to_s = {executor.submit(processor_func, s, f"T{i % self.max_workers + 1} "): (s, i) for i, s in
                       enumerate(missing_symbols)}
@@ -379,18 +129,30 @@ class QuantAnalysis:
                     res = f.result(timeout=20)
                     if res:
                         newly_fetched_data[s] = res
+                    else:
+                        failed_count += 1
                 except TimeoutError:
-                    print(f"  T{i % self.max_workers + 1} {s}: ❌ 获取 {entity_name} 超时")
+                    failed_count += 1
                 except Exception as e:
-                    print(f"  T{i % self.max_workers + 1} {s}: ❌ 获取 {entity_name} 异常: {str(e)[:50]}...")
+                    failed_count += 1
 
+        # 显示获取结果
+        success_count = len(newly_fetched_data)
+        if success_count > 0:
+            print(f"✅ 成功获取 {success_count}/{len(missing_symbols)} 条新的 {entity_name} 数据", end="")
+            if failed_count > 0:
+                print(f"（{failed_count}只失败，已跳过）")
+            else:
+                print()
+        elif failed_count > 0:
+            print(f"⚠️ 全部 {failed_count} 只股票获取失败（收盘后API不稳定，已跳过）")
+        
         if newly_fetched_data:
-            print(f"🔄 获取到 {len(newly_fetched_data)} 条新的 {entity_name} 数据")
             cached_data.update(newly_fetched_data)
             try:
                 with open(cache_path, 'w', encoding='utf-8') as f:
                     json.dump({'date': today_str, 'data': cached_data}, f, ensure_ascii=False, indent=4)
-                print(f"💾 {entity_name} 缓存已更新至 '{cache_filename}'，总计 {len(cached_data)} 条记录")
+                print(f"💾 {entity_name} 缓存已更新，总计 {len(cached_data)} 条记录")
             except IOError as e:
                 print(f"❌ 缓存 {entity_name} 失败: {e}")
 
@@ -404,7 +166,10 @@ class QuantAnalysis:
         cache_path = self.hot_stocks_cache_file
         cache_filename = os.path.basename(cache_path)
 
-        if os.path.exists(cache_path):
+        # 如果是强制刷新模式，跳过缓存检查
+        if self.force_refresh:
+            print("🔄 强制刷新模式：跳过缓存，直接从API获取热门股票...")
+        elif os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
@@ -412,6 +177,17 @@ class QuantAnalysis:
                         stocks = cache_data.get('stocks', [])
                         if stocks:
                             print(f"✅ 从缓存文件 '{cache_filename}' 加载热门股票列表，共 {len(stocks)} 条记录")
+                            
+                            # 打印缓存的股票列表
+                            print("\n" + "="*70)
+                            print("📋 已入选的热门股票列表（来自缓存）")
+                            print("="*70)
+                            for idx, stock in enumerate(stocks, 1):
+                                code = stock['代码']
+                                name = stock['股票名称']
+                                print(f"  {idx:>3}. ✅ {code} {name}")
+                            print("="*70 + "\n")
+                            
                             self._log_performance("get_hot_stocks", task_start)
                             return stocks
                         else:
@@ -419,58 +195,116 @@ class QuantAnalysis:
             except (json.JSONDecodeError, IOError):
                 print(f"⚠️ {cache_filename} 缓存文件损坏，将重新获取")
 
-        print("🔄 从API获取热门股票排行榜...")
-        hot_stock_codes = set()
-
+        if not self.force_refresh:
+            print("🔄 获取热门股票排行榜...")
+        else:
+            print("🔄 正在从API获取最新热门股票排行榜...")
+        
         # 获取东方财富热门股
         try:
             hot_rank_df = ak.stock_hot_rank_em()
-            if hot_rank_df is not None and not hot_rank_df.empty:
-                hot_stock_codes.update(hot_rank_df['代码'].tolist())
-                print(f"✅ 从东方财富获取 {len(hot_stock_codes)} 只热门股")
+            if hot_rank_df is None or hot_rank_df.empty:
+                print("❌ 未获取到热门股票")
+                self._log_performance("get_hot_stocks", task_start)
+                return []
+            
+            print(f"✅ 获取到 {len(hot_rank_df)} 只热门股")
         except Exception as e:
-            print(f"⚠️ 获取东方财富热门股失败: {e}")
-
-
-        if not hot_stock_codes:
-            print("❌ 未从任何来源获取到热门股")
+            print(f"❌ 获取热门股票失败: {e}")
             self._log_performance("get_hot_stocks", task_start)
             return []
 
-        print(f"ℹ️ 合并后共 {len(hot_stock_codes)} 只热门股，开始进行筛选...")
-
+        # 筛选主板非ST股票
         try:
-            # 获取实时行情进行筛选
-            spot_df = ak.stock_zh_a_spot_em()
-            spot_df['代码'] = spot_df['代码'].apply(lambda x: f"SH{x}" if x.startswith('6') else f"SZ{x}")
-
-            filtered_df = spot_df[spot_df['代码'].isin(hot_stock_codes)].copy()
-
-            # 筛选条件
-            is_main = filtered_df['代码'].str.startswith(('SZ00', 'SH60'))  # 主板
-            is_not_st = ~filtered_df['名称'].str.contains('ST')  # 非ST
-            is_price_ok = (filtered_df['最新价'] >= 5) & (filtered_df['最新价'] <= 30)  # 价格区间
-            is_volume_ok = filtered_df['成交量'] > 100000  # 成交量要足够
-            is_turnover_ok = filtered_df['换手率'] > 1.0  # 换手率要足够
-
-            # 应用筛选条件
-            final_df = filtered_df[is_main & is_not_st & is_price_ok & is_volume_ok & is_turnover_ok]
-
-            # 重命名并提取结果
-            final_df = final_df.rename(columns={'名称': '股票名称'})
-            final_stocks = final_df[['代码', '股票名称']].to_dict('records')
-
+            all_qualified_stocks = []  # 所有符合条件的股票
+            filtered_out = []
+            
+            print("\n" + "="*70)
+            print("📋 热门股票筛选详情（全部100只）")
+            print("="*70)
+            
+            # 处理所有100只股票
+            for idx, row in hot_rank_df.iterrows():
+                code = str(row['代码'])
+                name = str(row.get('股票名称', row.get('名称', '')))
+                rank = idx + 1
+                
+                # 获取股价和涨跌幅
+                try:
+                    price = float(row.get('最新价', 0))
+                except (ValueError, TypeError):
+                    price = 0
+                
+                try:
+                    change_pct = float(row.get('涨跌幅', 0))
+                except (ValueError, TypeError):
+                    change_pct = 0
+                
+                # 判断筛选条件
+                is_sh_main = code.startswith('SH60')
+                is_sz_main = code.startswith('SZ00')
+                is_st = 'ST' in name
+                is_price_ok = 5 < price < 30  # 股价在5-30元之间
+                is_change_ok = -3 < change_pct < 9  # 涨跌幅在-3%到9%之间
+                
+                # 主板：SH60xxxx（沪市主板）或 SZ00xxxx（深市主板）
+                # 非ST：名称不包含"ST"
+                # 股价：5元 < 股价 < 30元
+                # 涨跌幅：-3% < 涨跌幅 < 9%
+                if (is_sh_main or is_sz_main) and not is_st and is_price_ok and is_change_ok:
+                    all_qualified_stocks.append({'代码': code, '股票名称': name})
+                    print(f"  {rank:>3}. ✅ {code} {name:<12} ¥{price:>6.2f} {change_pct:>+6.2f}% - 入选")
+                else:
+                    # 记录筛选原因
+                    reasons = []
+                    if is_st:
+                        reasons.append("ST股票")
+                    if not is_sh_main and not is_sz_main:
+                        if code.startswith('SH68') or code.startswith('SZ30'):
+                            reasons.append("创业板/科创板")
+                        elif code.startswith('BJ') or code.startswith('SZ20'):
+                            reasons.append("北交所/新三板")
+                        else:
+                            reasons.append("非主板")
+                    if not is_price_ok and (is_sh_main or is_sz_main) and not is_st:
+                        if price <= 5:
+                            reasons.append(f"股价过低¥{price:.2f}")
+                        elif price >= 30:
+                            reasons.append(f"股价过高¥{price:.2f}")
+                        else:
+                            reasons.append("股价异常")
+                    if not is_change_ok and (is_sh_main or is_sz_main) and not is_st and is_price_ok:
+                        if change_pct <= -3:
+                            reasons.append(f"跌幅过大{change_pct:.2f}%")
+                        elif change_pct >= 9:
+                            reasons.append(f"涨幅过大{change_pct:.2f}%")
+                    
+                    reason_str = "、".join(reasons)
+                    filtered_out.append({'代码': code, '名称': name, '原因': reason_str})
+                    print(f"  {rank:>3}. ❌ {code} {name:<12} ¥{price:>6.2f} {change_pct:>+6.2f}% - 筛除（{reason_str}）")
+            
+            # 全部入选，不限制数量
+            final_stocks = all_qualified_stocks
+            
+            print("="*70)
+            print(f"✅ 最终入选：{len(final_stocks)} 只主板非ST股票")
+            if filtered_out:
+                print(f"❌ 筛除：{len(filtered_out)} 只股票")
+            print("="*70 + "\n")
+            
             if final_stocks:
+                # 保存到缓存
                 with open(cache_path, 'w', encoding='utf-8') as f:
                     json.dump({'date': today_str, 'stocks': final_stocks}, f, ensure_ascii=False, indent=4)
-                print(f"💾 热门股票列表已缓存至 '{cache_filename}'，筛选后剩 {len(final_stocks)} 条")
+                self._log_performance("get_hot_stocks", task_start)
+                return final_stocks
             else:
-                print("⚠️ 未获取到符合条件的热门股，不更新缓存")
-
-            self._log_performance("get_hot_stocks", task_start)
-            return final_stocks
+                print(f"⚠️ 筛选后无符合条件的股票")
+                self._log_performance("get_hot_stocks", task_start)
+                return []
+                
         except Exception as e:
-            print(f"❌ 获取实时行情进行筛选失败: {e}")
+            print(f"❌ 筛选股票时出错: {e}")
             self._log_performance("get_hot_stocks", task_start)
             return []
 
@@ -1005,17 +839,109 @@ class QuantAnalysis:
         self._log_performance("analyze_microstructure", task_start)
         return result
 
+    def _evaluate_liquidity(self, total_volume, tick_count):
+        """评估流动性充足度（日内交易关键）"""
+        # 流动性评分：确保有足够的交易量和笔数
+        if total_volume < 100000:  # 日成交量低于10万手
+            return -20  # 严重流动性不足
+        elif total_volume < 300000:  # 日成交量低于30万手
+            return -10  # 中度流动性不足
+        elif tick_count < 500:  # 成交笔数太少
+            return -5  # 轻度流动性不足
+        elif total_volume > 1000000:  # 成交量超过100万手
+            return +5  # 流动性优秀
+        else:
+            return 0  # 流动性正常
+    
+    def _calculate_momentum_acceleration(self, tick_df):
+        """计算动量加速度（捕捉日内爆发力）"""
+        if len(tick_df) < 5:
+            return 0
+        
+        try:
+            # 将tick数据分成5个时段
+            segment_size = len(tick_df) // 5
+            if segment_size == 0:
+                return 0
+            
+            segment_returns = []
+            for i in range(5):
+                start_idx = i * segment_size
+                end_idx = start_idx + segment_size if i < 4 else len(tick_df)
+                segment = tick_df.iloc[start_idx:end_idx]
+                
+                if len(segment) > 0:
+                    first_price = segment['成交价'].iloc[0]
+                    last_price = segment['成交价'].iloc[-1]
+                    if first_price > 0:
+                        ret = (last_price - first_price) / first_price
+                        segment_returns.append(ret)
+            
+            if len(segment_returns) >= 3:
+                # 计算加速度：后半段涨幅 - 前半段涨幅
+                # 正值表示加速上涨，负值表示减速或加速下跌
+                acceleration = (segment_returns[-1] - segment_returns[0])
+                return acceleration
+            
+            return 0
+        except Exception:
+            return 0
+    
+    def _calculate_sustainability(self, tick_df):
+        """计算上涨持续性（避免假突破）"""
+        if len(tick_df) < 10:
+            return 1.0
+        
+        try:
+            price_changes = tick_df['价格变动'].values
+            
+            # 统计连续上涨和连续下跌的情况
+            up_streaks = []
+            down_streaks = []
+            current_streak = 0
+            
+            for change in price_changes:
+                if change > 0:
+                    if current_streak >= 0:
+                        current_streak += 1
+                    else:
+                        if current_streak < 0:
+                            down_streaks.append(abs(current_streak))
+                        current_streak = 1
+                elif change < 0:
+                    if current_streak <= 0:
+                        current_streak -= 1
+                    else:
+                        if current_streak > 0:
+                            up_streaks.append(current_streak)
+                        current_streak = -1
+            
+            # 添加最后的streak
+            if current_streak > 0:
+                up_streaks.append(current_streak)
+            elif current_streak < 0:
+                down_streaks.append(abs(current_streak))
+            
+            # 计算平均持续性
+            avg_up = np.mean(up_streaks) if len(up_streaks) > 0 else 0
+            avg_down = np.mean(down_streaks) if len(down_streaks) > 0 else 1
+            
+            # 持续性比率：平均上涨持续 / 平均下跌持续
+            sustainability = avg_up / avg_down if avg_down > 0 else 1.0
+            return sustainability
+        except Exception:
+            return 1.0
+
     def _calculate_score_v8(self, metrics):
-        """计算综合评分 - V8版本"""
+        """计算综合评分 - V8.4日内版（优化日内交易指标）"""
         task_start = time.time()
 
         # 提取指标
-        fund_flow_z_score = metrics.get('fund_flow_z_score', 0)
-        super_flow_z_score = metrics.get('super_flow_z_score', 0)
-        flow_consistency = metrics.get('flow_consistency', 0)
-        net_buy_adv_ratio = metrics.get('net_buy_adv_ratio', 0)
-        impact_atr_ratio = metrics.get('impact_atr_ratio', 0)
-        excess_return = metrics.get('excess_return', 0)
+        relative_net_buy = metrics.get('relative_net_buy', 0)  # 相对净买入（新）
+        total_volume = metrics.get('total_volume', 0)  # 总成交量（新）
+        tick_count = metrics.get('tick_count', 0)  # tick笔数（新）
+        momentum_acceleration = metrics.get('momentum_acceleration', 0)  # 动量加速度（新）
+        sustainability = metrics.get('sustainability', 1.0)  # 上涨持续性（新）
         momentum_ratio = metrics.get('momentum_ratio', 0)
         closing_ratio = metrics.get('closing_ratio', 0)
         wash_trade_ratio = metrics.get('wash_trade_ratio', 0)
@@ -1026,79 +952,76 @@ class QuantAnalysis:
         volume_trend = metrics.get('volume_trend', 0)
         price_reversal = metrics.get('price_reversal', 0)
         buy_concentration = metrics.get('buy_concentration', 0)
-        rsi = metrics.get('rsi', 50)
+        active_buy_ratio = metrics.get('active_buy_ratio', 0.5)
 
-        # 资金流评分 (0-40分)
-        fund_flow_score = np.clip(fund_flow_z_score * 20, -30, 30)
-        super_flow_score = np.clip(super_flow_z_score * 10, -10, 10)
-        flow_consistency_score = flow_consistency * 5  # -5到5分
+        # 流动性评分 (-20~+5分) - 日内交易必须关注流动性
+        liquidity_score = self._evaluate_liquidity(total_volume, tick_count)
 
-        # 净买入评分 (0-20分)
-        net_buy_score = np.clip(net_buy_adv_ratio / 0.1 * 20, -20, 20)
+        # 相对净买入评分 (0-35分) - 使用相对值，大小盘公平
+        # 相对净买入20%为满分基准
+        net_buy_score = np.clip(relative_net_buy * 175, -35, 35)
 
-        # 价格冲击评分 (0-15分)
-        impact_score = 15 - (impact_atr_ratio / 0.1) * 30
-        impact_score = np.clip(impact_score, -15, 15)
-
-        # 买卖压力比评分 (0-10分)
+        # 买卖压力比评分 (0-20分) - 权重提升
         pressure_score = 0
         if pressure_ratio > 1.2:
-            pressure_score = min((pressure_ratio - 1.2) * 10, 10)
+            pressure_score = min((pressure_ratio - 1.2) * 20, 20)
         elif pressure_ratio < 0.8:
-            pressure_score = max((pressure_ratio - 0.8) * 10, -10)
+            pressure_score = max((pressure_ratio - 0.8) * 20, -20)
 
-        # 大单比例评分 (0-10分)
-        large_trade_score = (large_buy_ratio - large_sell_ratio) * 20
-        large_trade_score = np.clip(large_trade_score, -10, 10)
+        # 大单比例评分 (0-20分) - 权重提升
+        large_trade_score = (large_buy_ratio - large_sell_ratio) * 40
+        large_trade_score = np.clip(large_trade_score, -20, 20)
 
         # 动量评分 (0-15分)
         momentum_score = 0
         if momentum_ratio > 0.6:
-            momentum_score = 10 * min((momentum_ratio - 0.6) / 0.4, 1.0)
+            momentum_score = 15 * min((momentum_ratio - 0.6) / 0.4, 1.0)
         elif momentum_ratio < 0:
-            momentum_score = -10
+            momentum_score = -15
 
-        # 收盘动量评分 (0-5分)
+        # 收盘动量评分 (0-20分) - 日内交易重点关注尾盘
         closing_score = 0
         if closing_ratio > 0.2:
-            closing_score = 5 * min((closing_ratio - 0.2) / 0.3, 1.0)
+            closing_score = 20 * min((closing_ratio - 0.2) / 0.3, 1.0)
         elif closing_ratio < -0.2:
-            closing_score = -5 * min((abs(closing_ratio) - 0.2) / 0.3, 1.0)
+            closing_score = -20 * min((abs(closing_ratio) - 0.2) / 0.3, 1.0)
 
-        # 超额收益评分 (0-5分)
-        alpha_score = np.clip(excess_return / 2 * 5, -5, 5)
+        # 动量加速度评分 (0-10分) - 新增：捕捉爆发力
+        # 加速上涨（越涨越快）加分，减速或加速下跌扣分
+        acceleration_score = np.clip(momentum_acceleration * 200, -10, 10)
 
-        # 冲击不对称性评分 (0-5分)
-        asymmetry_score = np.clip(impact_asymmetry * 100, -5, 5)
+        # 上涨持续性评分 (0-10分) - 新增：避免假突破
+        # 持续性 > 1 表示上涨持续时间长于下跌，加分
+        sustainability_score = np.clip((sustainability - 1) * 10, -10, 10)
 
-        # 成交量趋势评分 (0-5分)
-        vol_trend_score = np.clip(volume_trend * 50, -5, 5)
+        # 冲击不对称性评分 (0-10分) - 权重保持
+        asymmetry_score = np.clip(impact_asymmetry * 200, -10, 10)
 
-        # 价格反转评分 (0-5分)
-        reversal_score = np.clip(price_reversal * 10, -5, 5)
+        # 成交量趋势评分 (0-10分) - 权重提升
+        vol_trend_score = np.clip(volume_trend * 100, -10, 10)
 
-        # 买盘集中度评分 (0-5分)
-        concentration_score = np.clip((buy_concentration - 0.2) * 20, -5, 5)
+        # 价格反转评分 (0-10分) - 权重提升
+        reversal_score = np.clip(price_reversal * 20, -10, 10)
 
-        # RSI评分 (0-5分)
-        rsi_score = 0
-        if rsi > 70:
-            rsi_score = -5 * min((rsi - 70) / 15, 1.0)  # 过热惩罚
-        elif rsi < 30:
-            rsi_score = 5 * min((30 - rsi) / 15, 1.0)  # 超跌奖励
+        # 买盘集中度评分 (0-15分) - 权重提升
+        concentration_score = np.clip((buy_concentration - 0.2) * 45, -15, 15)
 
-        # 对倒交易惩罚 (0-15分)
-        wash_trade_penalty = np.clip(wash_trade_ratio * 50, 0, 15)
+        # 主动买入比率评分 (0-15分) - 权重提升
+        active_buy_score = np.clip((active_buy_ratio - 0.5) * 60, -15, 15)
 
-        # 计算总分
+        # 对倒交易惩罚 (0-10分) - 降低权重，避免误杀（准确率约70%）
+        wash_trade_penalty = np.clip(wash_trade_ratio * 35, 0, 10)
+
+        # 计算总分（V8.4日内版：100%纯tick，无大盘依赖）
         total_score = (
-                fund_flow_score + super_flow_score + flow_consistency_score +
-                net_buy_score + impact_score +
-                pressure_score + large_trade_score +
+                net_buy_score + pressure_score + large_trade_score +
                 momentum_score + closing_score +
-                alpha_score + asymmetry_score +
+                acceleration_score +  # 新增：动量加速度
+                sustainability_score +  # 新增：上涨持续性
+                asymmetry_score +
                 vol_trend_score + reversal_score +
-                concentration_score + rsi_score -
+                concentration_score + active_buy_score +
+                liquidity_score -  # 新增：流动性评分
                 wash_trade_penalty
         )
 
@@ -1106,9 +1029,8 @@ class QuantAnalysis:
         return np.clip(total_score, -100, 100)
 
 
-    def analyze_stock_worker(self, stock, tick_df, market_performance, hist_metrics, fund_flow_data, volume_ratio,
-                             current_price, change_pct, turnover_rate):
-        """分析单只股票的工作函数"""
+    def analyze_stock_worker(self, stock, tick_df):
+        """分析单只股票的工作函数（纯tick数据分析）"""
         task_start = time.time()
         symbol = stock['代码']
         name = stock['股票名称']
@@ -1120,43 +1042,37 @@ class QuantAnalysis:
             self._log_performance("analyze_stock_worker", task_start)
             return None
 
-        # 计算日内价格变化
+        # 从tick数据中提取价格和涨跌幅
         first_price = float(clean_tick_df['成交价'].iloc[0])
         last_price = float(clean_tick_df['成交价'].iloc[-1])
+        current_price = last_price
         intraday_change = ((last_price - first_price) / first_price) * 100 if first_price > 0 else 0
-        excess_return = intraday_change - market_performance
+        change_pct = intraday_change
 
         # 分析交易方向
         trade_direction = self.analyze_trade_direction(clean_tick_df)
         net_buy_volume = trade_direction.get('net_buy_volume', 0)
 
+        # 计算相对净买入（日内关键指标）
+        total_volume = float(clean_tick_df['成交量'].sum())
+        tick_count = len(clean_tick_df)
+        relative_net_buy = net_buy_volume / total_volume if total_volume > 0 else 0
+
+        # 计算日内动量特征
+        momentum_acceleration = self._calculate_momentum_acceleration(clean_tick_df)
+        sustainability = self._calculate_sustainability(clean_tick_df)
+
         # 分析市场微观结构
         microstructure = self.analyze_microstructure(clean_tick_df)
 
-        # 获取历史指标
-        adv20 = hist_metrics.get('adv20', 0)
-        atr20 = hist_metrics.get('atr20', 0)
-        volatility = hist_metrics.get('volatility', 0)
-        trend_strength = hist_metrics.get('trend_strength', 0)
-        rsi = hist_metrics.get('rsi', 50)
-        macd = hist_metrics.get('macd', 0)
-        macd_signal = hist_metrics.get('macd_signal', 0)
-        bb_width = hist_metrics.get('bb_width', 0)
-        beta = hist_metrics.get('beta', 1.0)
-        alpha = hist_metrics.get('alpha', 0)
-        momentum_5d = hist_metrics.get('momentum_5d', 0)
-        momentum_10d = hist_metrics.get('momentum_10d', 0)
-        price_volume_corr = hist_metrics.get('price_volume_corr', 0)
-
-        # 计算关键比率
-        net_buy_adv_ratio = (net_buy_volume / adv20) if adv20 > 0 else 0
-        impact_atr_ratio = (microstructure.get('avg_abs_impact', 0) / atr20) if atr20 > 0 else 0
-
-        # 准备评分指标
+        # 准备评分指标（V8.4日内优化版）
         metrics = {
-            'net_buy_adv_ratio': net_buy_adv_ratio,
-            'impact_atr_ratio': impact_atr_ratio,
-            'excess_return': excess_return,
+            'net_buy_volume': net_buy_volume,
+            'relative_net_buy': relative_net_buy,  # 新增：相对净买入
+            'total_volume': total_volume,  # 新增：总成交量
+            'tick_count': tick_count,  # 新增：tick笔数
+            'momentum_acceleration': momentum_acceleration,  # 新增：动量加速度
+            'sustainability': sustainability,  # 新增：上涨持续性
             'momentum_ratio': trade_direction.get('momentum_ratio', 0),
             'closing_ratio': trade_direction.get('closing_ratio', 0),
             'wash_trade_ratio': wash_trade_ratio,
@@ -1167,79 +1083,35 @@ class QuantAnalysis:
             'impact_asymmetry': microstructure.get('impact_asymmetry', 0),
             'volume_trend': microstructure.get('volume_trend', 0),
             'price_reversal': microstructure.get('price_reversal', 0),
-            'buy_concentration': trade_direction.get('buy_concentration', 0),
-            'volatility': volatility,
-            'trend_strength': trend_strength,
-            'rsi': rsi,
-            'macd': macd,
-            'macd_signal': macd_signal,
-            'bb_width': bb_width,
-            'beta': beta,
-            'alpha': alpha,
-            'momentum_5d': momentum_5d,
-            'momentum_10d': momentum_10d,
-            'price_volume_corr': price_volume_corr,
-            'turnover_rate': turnover_rate
+            'buy_concentration': trade_direction.get('buy_concentration', 0)
         }
 
-        # 添加资金流指标
-        if fund_flow_data:
-            # 主力资金流Z-score
-            main_mean = fund_flow_data.get('main_mean', 0)
-            main_std = fund_flow_data.get('main_std', 1)
-            today_main = fund_flow_data.get('today_main', 0)
-            fund_flow_z_score = (today_main - main_mean) / main_std
-
-            # 超大单资金流Z-score
-            super_mean = fund_flow_data.get('super_mean', 0)
-            super_std = fund_flow_data.get('super_std', 1)
-            today_super = fund_flow_data.get('today_super', 0)
-            super_flow_z_score = (today_super - super_mean) / super_std
-
-            # 资金流一致性
-            flow_consistency = fund_flow_data.get('flow_consistency', 0)
-
-            metrics['fund_flow_z_score'] = fund_flow_z_score
-            metrics['super_flow_z_score'] = super_flow_z_score
-            metrics['flow_consistency'] = flow_consistency
-
-        # 计算V8评分
+        # 计算纯tick评分
         score = self._calculate_score_v8(metrics)
 
-        # 构建结果
+        # 构建结果（V8.4日内版）
         result = {
             'name': name,
             'score': score,
-            'model_version': "V8",
+            'model_version': "V8.4-Intraday",
             'current_price': current_price,
             'change_pct': change_pct,
-            'turnover_rate': turnover_rate,
-            'fund_flow_z_score': metrics.get('fund_flow_z_score', 0),
-            'super_flow_z_score': metrics.get('super_flow_z_score', 0),
-            'flow_consistency': metrics.get('flow_consistency', 0),
-            'net_buy_adv_ratio': net_buy_adv_ratio,
-            'impact_atr_ratio': impact_atr_ratio,
             'intraday_change': intraday_change,
-            'excess_return': excess_return,
+            'relative_net_buy': relative_net_buy,  # 新增
+            'total_volume': total_volume,  # 新增
+            'momentum_acceleration': momentum_acceleration,  # 新增
+            'sustainability': sustainability,  # 新增
             'active_buy_ratio': trade_direction.get('active_buy_ratio', 0.5),
             'momentum_ratio': trade_direction.get('momentum_ratio', 0),
             'closing_ratio': trade_direction.get('closing_ratio', 0),
-            'volume_ratio': volume_ratio,
             'wash_trade_ratio': wash_trade_ratio,
             'pressure_ratio': microstructure.get('pressure_ratio', 1.0),
             'large_buy_ratio': trade_direction.get('large_buy_ratio', 0),
             'large_sell_ratio': trade_direction.get('large_sell_ratio', 0),
             'kyle_lambda': microstructure.get('kyle_lambda', 0),
             'effective_spread': microstructure.get('effective_spread', 0),
-            'volatility': volatility,
-            'rsi': rsi,
-            'trend_strength': trend_strength,
-            'macd': macd,
-            'macd_signal': macd_signal,
             'price_reversal': microstructure.get('price_reversal', 0),
-            'buy_concentration': trade_direction.get('buy_concentration', 0),
-            'beta': beta,
-            'alpha': alpha
+            'buy_concentration': trade_direction.get('buy_concentration', 0)
         }
 
         self._log_performance("analyze_stock_worker", task_start)
@@ -1247,75 +1119,32 @@ class QuantAnalysis:
 
 
 
-    def _get_realtime_quotes_worker(self):
-        """获取实时行情数据"""
-        task_start = time.time()
-        try:
-            spot_df = ak.stock_zh_a_spot_em()
-            spot_df['代码'] = spot_df['代码'].apply(lambda x: f"SH{x}" if x.startswith('6') else f"SZ{x}")
-            volume_ratios = spot_df.set_index('代码')['量比'].to_dict()
-            current_prices = spot_df.set_index('代码')['最新价'].to_dict()
-            change_pcts = spot_df.set_index('代码')['涨跌幅'].to_dict()
-            turnover_rates = spot_df.set_index('代码')['换手率'].to_dict()
-            self._log_performance("get_realtime_quotes", task_start)
-            return volume_ratios, current_prices, change_pcts, turnover_rates
-        except Exception as e:
-            print(f"\n❌ 获取实时行情失败: {e}")
-            self._log_performance("get_realtime_quotes", task_start)
-            return {}, {}, {}, {}
-
     def analyze_stocks(self):
         """分析所有热门股票"""
         total_start = time.time()
-        market_performance = self._get_market_performance()
         all_stocks = self.get_hot_stocks()
         if not all_stocks: return []
 
         symbols = [stock['代码'] for stock in all_stocks]
 
-        print("\n📊 步骤 1/3: 批量获取历史和资金流数据...")
-        historical_metrics = self._incremental_cache_batch_processor(symbols, self.historical_metrics_cache_file,
-                                                                     self._get_historical_data, "历史行情")
-        fund_flow_data = self._incremental_cache_batch_processor(symbols, self.fund_flow_cache_file,
-                                                                 self._get_fund_flow_with_history, "资金流")
-
-        print("\n📊 步骤 2/3: 并行获取Tick数据和实时行情...")
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            tick_future = executor.submit(self.get_tick_data_batch, symbols)
-            realtime_future = executor.submit(self._get_realtime_quotes_worker)
-
-            tick_data_results = tick_future.result()
-            volume_ratios, current_prices, change_pcts, turnover_rates = realtime_future.result()
-
-        if volume_ratios:
-            print(f"✅ 成功获取 {len(volume_ratios)} 只股票的实时行情")
-        else:
-            print("❌ 获取实时行情失败，将跳过量比筛选和价格显示")
+        print("\n📊 步骤 1/1: 获取Tick数据...")
+        tick_data_results = self.get_tick_data_batch(symbols)
 
         valid_stocks = []
         stock_dict = {s['代码']: s for s in all_stocks}
         for symbol, tick_df in tick_data_results.items():
-            if symbol in historical_metrics:
-                valid_stocks.append((
-                    stock_dict[symbol],
-                    tick_df,
-                    historical_metrics[symbol],
-                    fund_flow_data.get(symbol),
-                    volume_ratios.get(symbol, 0),
-                    current_prices.get(symbol, 0),
-                    change_pcts.get(symbol, 0),
-                    turnover_rates.get(symbol, 0)
-                ))
-            else:
-                print(f"  ⚠️ {symbol} ({stock_dict.get(symbol, {}).get('股票名称', '')}) 缺少必要的历史行情数据，跳过")
+            valid_stocks.append((
+                stock_dict[symbol],
+                tick_df
+            ))
 
         if not valid_stocks: return []
 
-        print("\n📊 步骤 3/3: 批量分析并计算得分...")
+        print("\n📊 步骤 2/2: 批量分析并计算得分...")
         analysis_results = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [executor.submit(self.analyze_stock_worker, s, df, market_performance, hm, ffd, vr, cp, chg, tr)
-                       for s, df, hm, ffd, vr, cp, chg, tr in valid_stocks]
+            futures = [executor.submit(self.analyze_stock_worker, s, df)
+                       for s, df in valid_stocks]
             for f in as_completed(futures):
                 try:
                     res = f.result()
@@ -1348,7 +1177,7 @@ class QuantAnalysis:
         stocks_to_send = top_stocks[:30]
         if not stocks_to_send: return False
 
-        text = f"# 📈 量化分析报告 V8.0 - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        text = f"# 📈 量化分析报告 V8.4-Intraday - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         text += f"## 🏆 股票评分排序 (Top {len(stocks_to_send)})\n\n"
 
         for i, (symbol, data) in enumerate(stocks_to_send, 1):
@@ -1357,24 +1186,20 @@ class QuantAnalysis:
             change_pct = data.get('change_pct', 0)
             price_str = f"¥{data.get('current_price', 0):.2f}"
             change_str = f"{'📈' if change_pct > 0 else '📉'} {change_pct:.2f}%"
-            turnover_str = f"换手: {data.get('turnover_rate', 0):.2f}%"
-            title_line = f"### {i}. {data['name']} ({symbol})\n- **{price_str}** ({change_str}) | {turnover_str}\n"
+            title_line = f"### {i}. {data['name']} ({symbol})\n- **{price_str}** ({change_str})\n"
 
             score_line = f"- **得分**: **{data['score']:.2f}** {model_tag}\n"
 
-            z_score_line = f"- **资金流强度 (Z-score)**: 主力 **{data['fund_flow_z_score']:.2f}** / 超大单 **{data['super_flow_z_score']:.2f}**\n"
-
-            text += f"""{title_line}{score_line}{z_score_line}- **量比**: {data.get('volume_ratio', 'N/A'):.2f}
-- **买卖压力比**: {data.get('pressure_ratio', 1.0):.2f}
+            text += f"""{title_line}{score_line}- **买卖压力比**: {data.get('pressure_ratio', 1.0):.2f}
+- **主动买入比率**: {data.get('active_buy_ratio', 0.5):.2%}
 - **大单买入占比**: {data.get('large_buy_ratio', 0):.2%} vs 卖出 {data.get('large_sell_ratio', 0):.2%}
-- **日内涨跌**: {data['intraday_change']:.2f}% (超额: {data['excess_return']:.2f}%)
-- **净买入占比 (vs ADV20)**: {data['net_buy_adv_ratio']:.2%}
+- **日内涨跌**: {data['intraday_change']:.2f}%
 - **动量比率**: {data['momentum_ratio']:.2f} / 收盘: {data['closing_ratio']:.2f}
-- **技术指标**: RSI {data.get('rsi', 0):.1f} | Beta {data.get('beta', 0):.2f}
 - **对倒嫌疑**: {data.get('wash_trade_ratio', 0):.2%}
+- **Kyle's Lambda**: {data.get('kyle_lambda', 0):.6f}
 """
 
-        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V8.0", "text": text}}
+        message = {"msgtype": "markdown", "markdown": {"title": "量化分析报告 V8.4-Intraday", "text": text}}
         timestamp = str(round(time.time() * 1000))
         string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
@@ -1395,7 +1220,7 @@ class QuantAnalysis:
 
     def run_analysis(self):
         """运行完整分析流程"""
-        print("🔍 量化分析系统 V8.0 - 开始分析热门股票")
+        print("🔍 量化分析系统 V8.4-Intraday - 开始分析热门股票")
         try:
             top_stocks = self.analyze_stocks()
 

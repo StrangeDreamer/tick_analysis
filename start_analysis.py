@@ -35,10 +35,10 @@ def is_trading_time():
     
     return False
 
-def run_analysis():
+def run_analysis(force_refresh=False):
     """执行量化分析 - 直接导入模块调用"""
     try:
-        analyzer = QuantAnalysis()
+        analyzer = QuantAnalysis(force_refresh=force_refresh)
         
         # 执行分析，不再需要任何参数
         analyzer.run_analysis()
@@ -56,7 +56,7 @@ def run_analysis():
 def main():
     """启动量化分析系统"""
     parser = argparse.ArgumentParser(description='量化分析系统启动器')
-    parser.add_argument('--force', '-f', action='store_true', help='强制循环执行，忽略开市时间限制')
+    parser.add_argument('--force', '-f', action='store_true', help='强制循环执行（忽略开市时间限制 + 强制刷新热门股票缓存）')
     
     args = parser.parse_args()
     
@@ -65,7 +65,7 @@ def main():
     print("量化分析循环执行调度器启动")
     print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     if args.force:
-        print("执行模式: 强制循环执行（忽略开市时间限制）")
+        print("执行模式: 强制循环执行（忽略开市时间限制 + 强制刷新缓存）")
     else:
         print("开市时间: 周一至周五 9:30-11:30, 13:00-15:00")
         print("执行模式: 循环执行（每2分钟执行一轮）")
@@ -89,7 +89,7 @@ def main():
             
             # 执行量化分析
             start_time = time.time()
-            success = run_analysis()
+            success = run_analysis(force_refresh=args.force)
             end_time = time.time()
             
             execution_time = end_time - start_time
